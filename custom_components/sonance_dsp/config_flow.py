@@ -10,7 +10,7 @@ User step: host (and port, defaulted) -> connect and read
 address change must not orphan the entry. Serial is also the only acceptable
 identity source under HA's own rules -- IP, hostname and device name are not.
 
-Title the entry from ``amplifier-name`` (e.g. "Back Yard"), not the model.
+Title the entry from the device's own ``amplifier-name``, not the model.
 
 Options flow uses ``OptionsFlowWithReload``. Do **not** pair
 ``entry.add_update_listener`` with a reloading config-flow method -- that
