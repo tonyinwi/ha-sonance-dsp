@@ -5,8 +5,8 @@ SCAFFOLD ONLY -- not implemented yet.
 Two kinds of entity, both media_player:
 
 * **One per populated group** -- the zones. Named from the device: member
-  channels' ``output-names`` with the L/R suffix stripped, so ``Back Porch L``
-  and ``Back Porch R`` become **Back Porch**.
+  channels' ``output-names`` with the L/R suffix stripped, so ``Patio L``
+  and ``Patio R`` become **Patio**.
 * **One amp-level entity** driving the global commands (LEN_GLOBAL, no operand).
   Required, not cosmetic: Music Assistant maps exactly one entity per player to
   a volume control, and the single Sonos Port feeding this amp serves several

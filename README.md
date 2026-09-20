@@ -46,7 +46,13 @@ implementations:
 3. **The query reply and the command echo use different whitespace** — `Vol=-27 db` versus
    `Vol=-27db`. A parser written against one silently fails on the other.
 
-Full detail, with the evidence: [`docs/protocol.md`](docs/protocol.md).
+## Documentation
+
+| | |
+|---|---|
+| [`docs/protocol.md`](docs/protocol.md) | The protocol, with the evidence — and every place the device contradicts the vendor documentation. |
+| [`docs/design.md`](docs/design.md) | Why the integration is shaped this way, and which decisions are forced by the hardware rather than chosen. |
+| [`docs/roadmap.md`](docs/roadmap.md) | What ships when, the MVP's exit criteria, and the open questions. |
 
 ## Volume
 
@@ -73,8 +79,9 @@ DHCP address change will not orphan it.
 **It never sends the channel-to-group assignment opcodes (`0x21`–`0x28`).**
 
 They are destructive, there is no safe inverse without a prior backup, and the device
-*echoes success for changes it did not apply* — `Channel SGS Sub L group is B` came back for
-an assignment that never happened. Group topology belongs in the amplifier's own web UI at
+*echoes success for changes it did not apply* — `Channel <name> group is B` came back for an
+assignment that never happened, with the authoritative map still reading the old value
+afterwards. Group topology belongs in the amplifier's own web UI at
 `http://<amp>/BasicSetting.htm`.
 
 **Take a settings backup before doing anything unusual** — GeneralSettings.htm → BACKUP
