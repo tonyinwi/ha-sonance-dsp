@@ -1,0 +1,46 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Sonance DSP amplifier",
+        "description": "Enter the IP address of the amplifier. It will be identified by its serial number, so a DHCP address change will not orphan this entry.",
+        "data": {
+          "host": "Host",
+          "port": "Control port"
+        },
+        "data_description": {
+          "host": "The amplifier's IP address or hostname.",
+          "port": "TCP control port. Leave at 52000 unless it has been changed."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the amplifier. Check the IP address and that nothing else holds a control connection — the amplifier accepts only one at a time.",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This amplifier is already configured.",
+      "unique_id_mismatch": "The amplifier at this address reports a different serial number than the one configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Sonance DSP options",
+        "description": "The amplifier's range is -70 to +12 dB. The maximum below is the level reached at 100% on the volume slider. The default of 0 dB leaves +12 dB of headroom deliberately out of reach.",
+        "data": {
+          "max_db": "Maximum volume (dB)",
+          "scan_interval": "Polling interval (seconds)"
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "command_failed": {
+      "message": "Command {function_name} failed for {entity_id}."
+    },
+    "not_connected": {
+      "message": "Not connected to the amplifier."
+    }
+  }
+}

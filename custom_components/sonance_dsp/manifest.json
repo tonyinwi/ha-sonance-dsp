@@ -1,0 +1,14 @@
+{
+  "domain": "sonance_dsp",
+  "name": "Sonance DSP",
+  "version": "0.1.0",
+  "documentation": "https://github.com/tonyinwi/ha-sonance-dsp",
+  "issue_tracker": "https://github.com/tonyinwi/ha-sonance-dsp/issues",
+  "codeowners": ["@tonyinwi"],
+  "config_flow": true,
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "dependencies": [],
+  "requirements": [],
+  "loggers": ["custom_components.sonance_dsp"]
+}

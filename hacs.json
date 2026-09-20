@@ -1,0 +1,8 @@
+{
+  "name": "Sonance DSP",
+  "render_readme": true,
+  "country": "US",
+  "domains": ["media_player"],
+  "iot_class": ["Local Polling"],
+  "homeassistant": "2026.9.0"
+}

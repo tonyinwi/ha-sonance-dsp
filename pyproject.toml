@@ -1,0 +1,25 @@
+[project]
+name = "ha-sonance-dsp"
+version = "0.1.0"
+description = "Home Assistant integration for Sonance DSP amplifiers over IP"
+requires-python = ">=3.13"
+
+[dependency-groups]
+dev = [
+    "pytest-homeassistant-custom-component",
+    "ruff",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+
+[tool.coverage.run]
+source = ["custom_components/sonance_dsp"]
