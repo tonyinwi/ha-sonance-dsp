@@ -136,7 +136,22 @@ FORBIDDEN_OPCODES: Final = frozenset(range(0x21, 0x29))
 # Hence \s* everywhere rather than literal spacing. Note also that an absolute
 # volume set echoes as "VolumeUP" whatever direction it moved -- the Cmd: label
 # cannot be used to infer what was sent.
+#
+# The Group: letter is a CORRELATOR, not decoration. It is the only field that
+# can prove a reply belongs to the query that asked for it, so every scoped
+# getter must check it rather than parsing the value and discarding the letter.
+#
+# Mute and Source are IGNORECASE because no literal device output for them has
+# been recorded -- only 'Power status :On' is known, and that one capitalises.
+# Capture a real reply and record it in docs/protocol.md before tightening.
 RE_VOLUME: Final = re.compile(r",\s*Group:([A-H])\s+Vol=(-?\d{1,2})\s*db")
-RE_MUTE: Final = re.compile(r",\s*Group:([A-H])\s+Mute=(on|off)")
-RE_SOURCE: Final = re.compile(r",\s*Group:([A-H])\s+Src(\d)=(.+?)\s*$")
+RE_MUTE: Final = re.compile(r",\s*Group:([A-H])\s+Mute=(on|off)", re.IGNORECASE)
+RE_SOURCE: Final = re.compile(r",\s*Group:([A-H])\s+Src(\d)=(.+?)\s*$", re.IGNORECASE)
 RE_AMP_POWER: Final = re.compile(r"Power\s+status\s*:\s*(\w+)")
+
+# --- Config entry / options ------------------------------------------------
+CONF_MAX_DB: Final = "max_db"
+CONF_SCAN_INTERVAL: Final = "scan_interval"
+DEFAULT_SCAN_INTERVAL: Final = 10
+MIN_SCAN_INTERVAL: Final = 5
+MAX_SCAN_INTERVAL: Final = 300
