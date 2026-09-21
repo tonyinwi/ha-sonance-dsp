@@ -58,17 +58,56 @@ second connection does not merely fail — it silently corrupts the first socket
 stream, which is far worse, because the failure surfaces as wrong values rather than as an
 error. This rules out a connection pool, and it rules out connect-per-command.
 
-**FIFO future correlation.** A single socket pipelines correctly: N queries return N
-ordered replies. Each command pushes a `Future` onto a queue; a reader task resolves the
-head. Replies carry no sequence number and no request id, so ordering *is* the correlation
-— which is another reason a second connection is intolerable.
+**Positional correlation, serialised by a lock.** Replies carry no sequence number and no
+request id. The Nth reply belongs to the Nth command and nothing in the payload can prove
+it — which is another reason a second connection is intolerable.
+
+An earlier draft of this document specified pipelining: push a `Future` per command onto a
+queue, let a reader task resolve the head. The device does pipeline correctly — N queries
+down one socket return N ordered replies — so this works right up until a command gets no
+reply. Then the queue is permanently one ahead of the stream, and *every subsequent reply
+resolves the wrong request*, silently, reporting one zone's volume as another's.
+
+That is not hypothetical here: a group with no channels answers with silence, so the
+no-reply case is a normal part of discovery rather than an error path.
+
+The implementation therefore holds an `asyncio.Lock` across each write-then-read. It costs
+a round trip per command on a poll cycle of a handful of commands, and in exchange a
+timeout is a local event instead of a corrupting one. When a read does time out unexpectedly
+the connection is dropped and reopened, because reconnecting is the only way to be *certain*
+of alignment again.
 
 **Fixed-width reads, never `readline()`.** Replies are exactly 50 bytes, NUL-padded, with
 no terminator. `readexactly(50)` under a timeout; a line-oriented reader waits forever for
 a newline that never comes.
 
-Connection loss is handled by an exponential backoff capped at 30 seconds, with a
-connection-state callback so entities flip to unavailable rather than serving stale values.
+**The group letter is a correlator, and must be checked.** Scoped replies echo their
+`Group:` letter. That single field is the only way to prove a reply belongs to the query
+that asked for it, and checking it is what makes a late reply detectable instead of
+silently authoritative. A group that answers *late* rather than not at all is otherwise
+indistinguishable from the next group answering promptly — one slow zone makes zone A
+disappear and invents a phantom zone C, for the life of the config entry.
+
+The getters raise on a mismatch, so a desync becomes a failed poll and a clean reconnect
+instead of wrong values. Discovery instead discards the stale reply and continues, because
+there the enumeration is cross-checked against the authoritative HTTP channel map anyway,
+and failing setup over a momentarily slow amplifier would be worse than under-reporting a
+zone the cross-check then restores.
+
+`readexactly` does not consume its buffer until it holds all 50 bytes, so a cancelled read
+leaves everything already delivered queued for the next reader. Every exit path from a
+request therefore tears the socket down — including **cancellation from outside**, which
+`asyncio.timeout` does not convert into `TimeoutError` and which Home Assistant raises
+routinely when it cancels a coordinator refresh on reload.
+
+Connection loss is handled by **lazy reconnection**, not a backoff loop inside the client.
+A failed read tears the socket down; the next command reopens it. The retry cadence is
+therefore the coordinator's poll interval, and Home Assistant's own coordinator backoff
+covers repeated failure — a second backoff loop underneath it would only fight with it.
+
+Entity availability follows the coordinator's last update rather than the socket's state.
+Keying it on the socket would mark every zone unavailable for a whole interval over one
+late reply, since a late reply is exactly what tears the socket down.
 
 ### A consequence worth stating plainly
 
@@ -135,17 +174,26 @@ _attr_supported_features = (
 )
 ```
 
-`RECEIVER` and `VOLUME_STEP` are load-bearing. HomeKit Bridge routes `media_player` by
-device class:
+`RECEIVER` and `VOLUME_STEP` are load-bearing, and the choice is a **trade, not a free
+win**. HomeKit Bridge routes `media_player` by device class:
 
-- `SPEAKER`, or unset, produces an accessory class with **no volume characteristic at all** —
-  and a volume-only entity is then dropped entirely as having "no supported features".
-- `RECEIVER` routes to the receiver accessory, which builds its speaker service **only if
-  `VOLUME_MUTE` or `VOLUME_STEP` is present.**
+- `RECEIVER` routes to the receiver accessory — the only route that carries a real volume
+  characteristic. It builds its speaker service **only if `VOLUME_MUTE` or `VOLUME_STEP` is
+  present**, so `VOLUME_SET` alone yields nothing there.
+- `SPEAKER`, or unset, falls through to feature validation. With `VOLUME_MUTE` declared the
+  entity does bridge — as a mute-only switch accessory with **no volume at all**. It is
+  dropped entirely only when `VOLUME_MUTE` is absent too.
 
-So `VOLUME_SET` alone — the obvious minimal choice for an amplifier — yields nothing in
-HomeKit. Alexa and Assist are satisfied by `VOLUME_SET` on its own; HomeKit is the binding
-constraint, and it is invisible until someone opens the Home app.
+The cost of `RECEIVER`: Home Assistant treats `TV`/`RECEIVER`/`PROJECTOR` as
+**accessory-mode only**, and a HomeKit bridge created through the UI sets
+`exclude_accessory_mode`, so these zones are **silently excluded from it** — no warning.
+Exposing them to HomeKit means a separate HomeKit instance per zone, which is what every
+AVR integration requires and is standard HA behaviour rather than a defect here.
+
+So: `RECEIVER` buys a real volume slider at the price of per-zone pairing; `SPEAKER` buys
+bridging at the price of having no volume, which is the wrong half of the trade for an
+amplifier. Alexa and Assist are satisfied by `VOLUME_SET` alone and are unaffected either
+way. None of this is visible until someone opens the Home app.
 
 ### Why not `number` entities for volume
 
@@ -155,6 +203,23 @@ Speaker interface and HomeKit entirely — `number` is not bridged. The trade is
 
 If volume history matters later, add a `number` at `EntityCategory.DIAGNOSTIC` *alongside*
 the `media_player`, rather than moving the primary control.
+
+## Known limitations
+
+Recorded here rather than left to be rediscovered:
+
+- **Zone names are read once, at setup.** Renaming a zone in the amplifier's web UI does
+  not propagate until the config entry is reloaded, and neither does adding or removing a
+  zone. The channel map is only read during discovery.
+- **Group power is visible but not controllable.** It is surfaced as an attribute; there is
+  no `TURN_ON`/`TURN_OFF` yet, so the entity deliberately never renders `OFF` — a zone
+  shown as off with no way to turn it on is a dead tile.
+- **Mute and source reply formats are unverified.** Only the volume and amplifier-power
+  literals have been captured from real hardware. The parsers are case-insensitive and log
+  a warning with the raw text when a reply arrives but does not match, so a format surprise
+  becomes a bug report rather than a permanently dead control.
+- **One controller at a time.** See the connection model: this integration and any
+  Savant/Control4/RTI system are mutually exclusive.
 
 ## Volume
 
