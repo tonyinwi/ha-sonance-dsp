@@ -22,7 +22,13 @@ DEFAULT_HTTP_PORT: Final = 80
 
 HTTP_HANDLER_PATH: Final = "/Web/Handler.php"
 HTTP_PAGE_STATUS: Final = "status"
-HTTP_PAGE_BASIC: Final = "basicsettings"
+# NOT "basicsettings". That page exists and answers, but it is an older,
+# cut-down view: it omits turn-on volume, maximum volume, gain offset,
+# level trim, stereo/mono, bridge mode and the second source slot. The
+# In/Out Settings tab reads this one instead, and Landing.htm does not link
+# to it -- it is reachable only from inside GeneralSettings.htm, which is
+# why the lesser endpoint is the easy one to find.
+HTTP_PAGE_IN_OUT: Final = "in-out-settings"
 HTTP_PAGE_GENERAL: Final = "general-settings"
 
 # The amp accepts exactly ONE TCP session. A second concurrent connection

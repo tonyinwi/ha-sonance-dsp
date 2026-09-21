@@ -44,7 +44,7 @@ HOST = "192.0.2.10"
 # which keeps these independent of the cache-buster and parameter order.
 GENERAL = re.compile(r"page=general-settings")
 STATUS = re.compile(r"page=status")
-BASIC = re.compile(r"page=basicsettings")
+IN_OUT = re.compile(r"page=in-out-settings")
 ANY_PAGE = re.compile(r"Handler\.php")
 
 # Shaped like a real general-settings reply: identity fields sit alongside
@@ -68,7 +68,7 @@ STATUS_PAYLOAD = {
     "mute-volumes": ["off", "on", "off", "off", "off", "off", "off", "off"],
 }
 
-BASIC_SETTINGS_PAYLOAD = {
+IN_OUT_PAYLOAD = {
     "output-names": [
         "Patio L",
         "Patio R",
@@ -87,6 +87,16 @@ BASIC_SETTINGS_PAYLOAD = {
     ],
     "output-groups": ["a", "a", "b", "b", "c", "c", "d", "d"],
     "dsp-presets": [44, 44, 47, 47, 48, 48, 0, 0],
+    # Fields the older "basicsettings" page does not return at all. Their
+    # absence is exactly why the endpoint was switched.
+    "turn-on-volumes": ["-27", "-27", "-27", "-27", "-27", "-27", "-45", "-45"],
+    "maximum-volumes": ["12", "12", "12", "12", "0", "0", "12", "12"],
+    "gain-offset": ["-6", "-6", "-1", "-1", "4", "4", "0", "0"],
+    "level-trim-dBs": ["0", "0", "0", "0", "0", "0", "0", "0"],
+    "stereo-or-mono": ["stereo"] * 8,
+    "mode-sources": ["off"] * 8,
+    "sources-1": [0, 1, 0, 1, 0, 1, 0, 1],
+    "sources-2": [4, 5, 4, 5, 4, 5, 6, 7],
     "output-volumes": ["-27", "-27", "-31", "-31", "-20", "-20", "-70", "-70"],
 }
 
@@ -276,15 +286,15 @@ async def test_group_mute_reads_the_mute_key_not_the_power_key(
 # --- topology --------------------------------------------------------------
 
 
-async def test_topology_parses_basicsettings(
+async def test_topology_parses_in_out_settings(
     amp: AiohttpClientMocker, api: SonanceHttpApi
 ) -> None:
-    amp.get(BASIC, json=BASIC_SETTINGS_PAYLOAD)
+    amp.get(IN_OUT, json=IN_OUT_PAYLOAD)
 
     result = await api.topology()
 
-    assert result.output_names == BASIC_SETTINGS_PAYLOAD["output-names"]
-    assert result.input_names == BASIC_SETTINGS_PAYLOAD["input-names"]
+    assert result.output_names == IN_OUT_PAYLOAD["output-names"]
+    assert result.input_names == IN_OUT_PAYLOAD["input-names"]
     assert result.output_groups == ["a", "a", "b", "b", "c", "c", "d", "d"]
 
 
@@ -293,7 +303,7 @@ async def test_topology_strips_and_stringifies(
 ) -> None:
     """Installer-typed names arrive padded; group letters must compare cleanly."""
     amp.get(
-        BASIC,
+        IN_OUT,
         json={
             "output-names": ["  Patio L  ", "Patio R"],
             "input-names": [" Streamer L Digital "],
@@ -313,7 +323,7 @@ async def test_topology_strips_and_stringifies(
 async def test_topology_tolerates_missing_keys(
     amp: AiohttpClientMocker, api: SonanceHttpApi, payload: dict
 ) -> None:
-    amp.get(BASIC, json=payload)
+    amp.get(IN_OUT, json=payload)
 
     result = await api.topology()
 
@@ -404,7 +414,7 @@ def test_group_name_is_none_when_the_only_member_is_unnamed() -> None:
 
 def test_group_members_returns_channel_indices() -> None:
     topo = topology(
-        output_names=BASIC_SETTINGS_PAYLOAD["output-names"],
+        output_names=IN_OUT_PAYLOAD["output-names"],
         output_groups=["a", "a", "b", "b", "c", "c", "d", "d"],
     )
 
@@ -489,7 +499,7 @@ async def test_error_message_names_the_page(
     """Three pages fail independently; the log line has to say which one."""
     amp.get(ANY_PAGE, status=500)
 
-    with pytest.raises(SonanceHttpError, match="basicsettings"):
+    with pytest.raises(SonanceHttpError, match="in-out-settings"):
         await api.topology()
 
 
@@ -508,7 +518,7 @@ async def test_every_request_is_action_read(
     """
     amp.get(GENERAL, json=GENERAL_SETTINGS_PAYLOAD)
     amp.get(STATUS, json=STATUS_PAYLOAD)
-    amp.get(BASIC, json=BASIC_SETTINGS_PAYLOAD)
+    amp.get(IN_OUT, json=IN_OUT_PAYLOAD)
 
     await api.identity()
     await api.group_power()
@@ -529,7 +539,7 @@ async def test_pages_requested_are_the_three_documented_ones(
 ) -> None:
     amp.get(GENERAL, json=GENERAL_SETTINGS_PAYLOAD)
     amp.get(STATUS, json=STATUS_PAYLOAD)
-    amp.get(BASIC, json=BASIC_SETTINGS_PAYLOAD)
+    amp.get(IN_OUT, json=IN_OUT_PAYLOAD)
 
     await api.identity()
     await api.group_power()
@@ -538,7 +548,7 @@ async def test_pages_requested_are_the_three_documented_ones(
     assert [url.query["page"] for _m, url, _d, _h in amp.mock_calls] == [
         "general-settings",
         "status",
-        "basicsettings",
+        "in-out-settings",
     ]
 
 
@@ -609,3 +619,80 @@ def test_group_name_for_factory_default_channels() -> None:
     assert topology.group_name(0) == "Patio"
     assert topology.group_name(1) == "Output 2"
     assert topology.group_name(3) == "Output 4"
+
+
+# ---------------------------------------------------------------------------
+# Fields that only the In/Out Settings endpoint returns
+#
+# The older "basicsettings" page answers happily and omits all of these, which
+# is the whole reason for the switch -- a wrong-but-working endpoint is harder
+# to notice than a broken one.
+# ---------------------------------------------------------------------------
+
+
+async def test_topology_reads_the_fields_basicsettings_omits(
+    amp: AiohttpClientMocker, api: SonanceHttpApi
+) -> None:
+    amp.get(IN_OUT, json=IN_OUT_PAYLOAD)
+    t = await api.topology()
+
+    assert t.turn_on_volumes[6] == "-45"
+    assert t.maximum_volumes[0] == "12"
+    assert t.gain_offset == ["-6", "-6", "-1", "-1", "4", "4", "0", "0"]
+    assert t.level_trim_dbs == ["0"] * 8
+    assert t.stereo_or_mono == ["stereo"] * 8
+    assert t.mode_sources == ["off"] * 8
+    assert t.sources_1 == [0, 1, 0, 1, 0, 1, 0, 1]
+    assert t.sources_2 == [4, 5, 4, 5, 4, 5, 6, 7]
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Streamer L Digital", 1),   # input index 0 -> pair 1
+        ("Streamer R Digital", 1),   # index 1, same pair
+        ("Input 2L", 2),
+        ("Input 2R", 2),
+        ("  input 2l  ", 2),         # whitespace and case tolerated
+        ("Not An Input", None),
+    ],
+)
+def test_source_number_for_input_name(name: str, expected: int | None) -> None:
+    """The TCP reply's digit is a lie; the NAME is what identifies the source.
+
+    Selecting source 2 still answers ``Src1=Input 2L`` -- the label stays
+    ``Src1`` whatever is selected. Resolving through input_names is the only
+    way to learn which source is actually live.
+    """
+    t = Topology(
+        output_names=[],
+        input_names=IN_OUT_PAYLOAD["input-names"],
+        output_groups=[],
+    )
+    assert t.source_number_for_input_name(name) == expected
+
+
+def test_maximum_db_takes_the_lowest_in_the_group() -> None:
+    """A group is only as loud as its most restricted channel.
+
+    The amplifier keeps its own per-channel ceiling, independent of this
+    integration's max_db option. Taking the max of the pair would let a zone be
+    driven past a limit the installer set on one of its channels.
+    """
+    t = Topology(
+        output_names=IN_OUT_PAYLOAD["output-names"],
+        input_names=IN_OUT_PAYLOAD["input-names"],
+        output_groups=IN_OUT_PAYLOAD["output-groups"],
+        maximum_volumes=IN_OUT_PAYLOAD["maximum-volumes"],
+    )
+    assert t.maximum_db(0) == 12          # channels 0,1 -> both 12
+    assert t.maximum_db(2) == 0           # channels 4,5 -> both 0
+    assert t.maximum_db(7) is None        # group H has no members
+
+
+def test_topology_defaults_are_empty_not_none() -> None:
+    """A field the endpoint omits must not become None and crash a consumer."""
+    t = Topology(output_names=[], input_names=[], output_groups=[])
+    assert t.gain_offset == []
+    assert t.sources_1 == []
+    assert t.maximum_db(0) is None

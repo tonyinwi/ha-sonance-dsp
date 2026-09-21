@@ -28,9 +28,19 @@ Undocumented in any vendor artifact — found by reading the web UI's own JavaSc
 
 ```
 GET /Web/Handler.php?page=status&action=read
-GET /Web/Handler.php?page=basicsettings&action=read
+GET /Web/Handler.php?page=in-out-settings&action=read
 GET /Web/Handler.php?page=general-settings&action=read
 ```
+
+⚠️ **Use `in-out-settings`, not `basicsettings`.** Both exist and both answer, which is what
+makes this worth writing down: `basicsettings` is an older, cut-down view of the same data
+and returns **none** of `turn-on-volumes`, `maximum-volumes`, `gain-offset`, `level-trim-dBs`,
+`stereo-or-mono`, `mode-sources` or `sources-2`. A wrong-but-working endpoint is harder to
+notice than a broken one.
+
+It is also the harder one to find. `Landing.htm` links only `BasicSetting.htm` and
+`GeneralSettings.htm`; the In/Out and EQ tabs are linked from *inside* `GeneralSettings.htm`,
+so following the landing page alone leads to the lesser endpoint.
 
 `status` returns per-group power and mute:
 
@@ -40,7 +50,7 @@ GET /Web/Handler.php?page=general-settings&action=read
  "mute-volumes":["off","off","off","off","off","off","off","off"]}
 ```
 
-`basicsettings` returns the zone topology:
+`in-out-settings` returns the zone topology and every per-channel setting:
 
 ```json
 {"output-names":["Zone 1 L","Zone 1 R","Zone 2 L", ...],
@@ -50,8 +60,25 @@ GET /Web/Handler.php?page=general-settings&action=read
  "output-volumes":["-27","-27", ...]}
 ```
 
-`output-names` and `input-names` are installer-assigned; the values above are illustrative.
-`output-groups` is the channel-to-group map, one letter per channel, 1L through 4R.
+Every list is indexed by channel, 1L through 4R. Beyond the fields above it also returns
+`turn-on-volumes`, `maximum-volumes`, `gain-offset`, `level-trim-dBs`, `stereo-or-mono`,
+`bridge-modes`, `mode-sources` and `sources-2`.
+
+Three of those change how the device should be driven:
+
+- **`maximum-volumes`** is the amplifier's *own* per-channel ceiling. An integration's own
+  volume limit cannot raise a zone past it, and a group is only as loud as its most
+  restricted channel.
+- **`gain-offset`** is installer calibration, and it means **a dB figure is not comparable
+  between zones**: two zones both reading −27 dB with offsets of −6 and +4 are ten dB apart
+  in practice. Anything that averages zone volumes has to say so.
+- **`sources-1` / `sources-2`** are indices into `input-names`, giving each output channel's
+  two assignable source slots. `mode-sources` toggles the second. This is an *assignment*,
+  not a selection — which slot is live comes from the TCP source query.
+
+Note the UI's "Source 1 / Source 2" rows are a different concept from the TCP `source 1–4`
+commands: the former are the two assignable slots per channel, the latter select among the
+four physical input pairs.
 
 `general-settings` returns `serial-number`, `amplifier-name`, `amplifier-model`,
 `firmware-version`, and network config. **Use `serial-number` as the config entry's
@@ -147,7 +174,7 @@ MUTE toggle/on/off     FF 55 02 06|07|08 <N>        all groups  FF 55 01 06|07|0
 GET MUTE               FF 55 02 12 <N>
 
 SOURCE 1-4             FF 55 02 <08+S> <N>          all groups  FF 55 01 <08+S>
-GET SOURCE             FF 55 02 11 <N>
+GET SOURCE             FF 55 02 11 <N>    -- see the two traps below
 
 GROUP POWER on/off/tog FF 55 02 65|66|67 <N>        all groups  FF 55 01 65|66|67
 GROUP POWER QUERY      -- does not exist; use HTTP page=status
@@ -159,6 +186,45 @@ GET DSP PRESET         FF 55 02 16 <C>
 GET SHORT PROTECT      FF 55 02 17 <C>
 GET OVERTEMP           FF 55 02 18 <C>
 ```
+
+## Source: two traps, both measured
+
+Captured on group D (no speakers connected) on 2026-09-20.
+
+### `Src1=` is a fixed label, not the selected source
+
+```
+select source 2  ->  query answers  'Cmd:Source1     ,Group:D Src1=Input 2L'
+select source 3  ->  query answers  'Cmd:Source1     ,Group:D Src1=Sonos L Analog'
+select source 4  ->  query answers  'Cmd:Source1     ,Group:D Src1=Input 4L'
+```
+
+**Both `Cmd:Source1` and `Src1=` stay `1` whatever is selected.** Only the name changes. A
+parser that reads the digit as the source number gets `1` forever.
+
+Resolve the source from the **name** instead, through `input-names` from the HTTP endpoint.
+Inputs are stereo pairs, so indices 0/1 are source 1, 2/3 are source 2, and so on; a group
+query reports its LEFT member, so the name is normally the even index of the pair.
+
+### A source *change* replies with 256 bytes, not 50
+
+```
+SET source 2  ->  256B:  [0]      'Cmd:Source2     , Group:D'
+                         [50..255] all NUL
+SET source 1  ->   50B:  [0]      'Cmd:Source1     , Group:D'
+```
+
+The payload is in the first 50 bytes; the rest is padding. Opcodes `0x0A`/`0x0B`/`0x0C` pad
+to 256, `0x09` does not — reproducible across repeats.
+
+A client reading a fixed 50 bytes takes the first frame and leaves **206 NUL bytes queued**,
+so the next four commands read pure padding and look like "no reply" before the fifth
+resynchronises. Any client that sends a source change must drain to the end of the frame.
+
+This is the same class of problem the sibling Triad AMS integration solves with an adaptive
+drain — its comments describe firmware that pads to 150 bytes and firmware that terminates
+with a single NUL. The variation is not only across firmware revisions: on this amplifier it
+varies **by opcode within one firmware**.
 
 ## ⛔ Forbidden: channel→group assignment
 
