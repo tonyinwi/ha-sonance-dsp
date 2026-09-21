@@ -32,3 +32,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/ruff-action@v3
+
+  pytest:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.13 is what pyproject claims to support; 3.14 is what Home Assistant
+        # actually ships on. Testing only one of them leaves the other a claim
+        # rather than a fact.
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install test dependencies
+        # pytest-homeassistant-custom-component pins the Home Assistant version
+        # it was generated against, so it drags in HA itself. That is the point:
+        # the suite runs against real HA internals, not a stub.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest-homeassistant-custom-component pytest-cov
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -q \
+            --cov=custom_components/sonance_dsp \
+            --cov-report=term-missing:skip-covered \
+            --cov-report=xml
+
+      - name: Coverage summary
+        if: always()
+        # Reported, not gated. A threshold now would only encode today's number;
+        # the gate worth having is 100% on config_flow.py, which the Bronze
+        # quality scale requires and which we cannot claim until the config flow
+        # has tests at all.
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import xml.etree.ElementTree as ET
+          root = ET.parse("coverage.xml").getroot()
+          print(f"### Coverage: {float(root.get('line-rate', 0)) * 100:.1f}%\n")
+          print("| Module | Line rate |")
+          print("|---|---|")
+          for cls in sorted(root.iter("class"), key=lambda c: c.get("filename")):
+              name = cls.get("filename").split("/")[-1]
+              print(f"| `{name}` | {float(cls.get('line-rate', 0)) * 100:.0f}% |")
+          EOF
