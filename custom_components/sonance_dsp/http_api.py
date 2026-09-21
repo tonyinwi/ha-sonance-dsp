@@ -20,7 +20,7 @@ than maintaining a model of which fields can be trusted.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
@@ -28,8 +28,8 @@ import aiohttp
 from .const import (
     GROUP_LETTERS,
     HTTP_HANDLER_PATH,
-    HTTP_PAGE_BASIC,
     HTTP_PAGE_GENERAL,
+    HTTP_PAGE_IN_OUT,
     HTTP_PAGE_STATUS,
 )
 
@@ -54,24 +54,50 @@ class AmplifierIdentity:
 
 @dataclass(frozen=True, slots=True)
 class Topology:
-    """Channel layout as the amplifier reports it."""
+    """Channel layout and per-channel settings, as the amplifier reports them.
+
+    Every list is indexed by output channel, 1L..4R, so index 0 is channel 1L
+    and index 7 is 4R. ``input_names`` is indexed by INPUT channel on the same
+    1L..4R scheme, which is why a source pair maps to indices ``2n`` and
+    ``2n+1``.
+    """
 
     output_names: list[str]
     input_names: list[str]
     output_groups: list[str]
+    # Per output channel. Read but not yet surfaced -- see the notes on each.
+    dsp_presets: list[int] = field(default_factory=list)
+    output_volumes: list[str] = field(default_factory=list)
+    # The level a channel returns to when the amplifier powers on. The vendor's
+    # own integrator notes single this out: the factory default is +12 dB, i.e.
+    # maximum gain on every power cycle.
+    turn_on_volumes: list[str] = field(default_factory=list)
+    # The amplifier's OWN per-channel ceiling, independent of this
+    # integration's max_db option. Ours cannot raise a zone above this.
+    maximum_volumes: list[str] = field(default_factory=list)
+    # Installer calibration, and the reason a dB figure is NOT comparable
+    # between zones: two zones at -27 dB with offsets of -6 and +4 are ten dB
+    # apart in practice. Anything that averages zone volumes has to say so.
+    gain_offset: list[str] = field(default_factory=list)
+    level_trim_dbs: list[str] = field(default_factory=list)
+    stereo_or_mono: list[str] = field(default_factory=list)
+    mode_sources: list[str] = field(default_factory=list)
+    # Which INPUT index feeds each output channel's source slot. An assignment,
+    # not a selection: which slot is live comes from the TCP source query.
+    sources_1: list[int] = field(default_factory=list)
+    sources_2: list[int] = field(default_factory=list)
 
     def group_name(self, group: int) -> str | None:
         """Derive a zone name from the member channels' output names.
 
         ``Patio L`` + ``Patio R`` -> ``Patio``. Falls back to the first member's
-        name when the common prefix is empty, and to None when the group has no
+        name when the trimmed names disagree, and to None when the group has no
         members at all.
         """
-        letter = GROUP_LETTERS[group].lower()
         members = [
             self.output_names[i]
-            for i, g in enumerate(self.output_groups)
-            if g.lower() == letter and i < len(self.output_names)
+            for i in self.group_members(group)
+            if i < len(self.output_names)
         ]
         if not members:
             return None
@@ -84,6 +110,33 @@ class Topology:
     def group_members(self, group: int) -> list[int]:
         letter = GROUP_LETTERS[group].lower()
         return [i for i, g in enumerate(self.output_groups) if g.lower() == letter]
+
+    def source_number_for_input_name(self, name: str) -> int | None:
+        """Map an input NAME back to its 1-based source number.
+
+        This exists because the TCP source reply cannot be trusted for the
+        number. ``Src1=`` is a fixed label: selecting source 2 still answers
+        ``Cmd:Source1 ,Group:D Src1=Input 2L``, so the digit is always 1 and
+        only the name changes. Verified against all four sources.
+
+        Inputs are stereo pairs -- indices 0/1 are source 1, 2/3 are source 2 --
+        and a group query reports its LEFT member, so the name is normally the
+        even index of the pair. Both are accepted regardless.
+        """
+        target = name.strip().casefold()
+        for index, candidate in enumerate(self.input_names):
+            if candidate.strip().casefold() == target:
+                return index // 2 + 1
+        return None
+
+    def maximum_db(self, group: int) -> int | None:
+        """The lowest device ceiling among a group's channels, in dB."""
+        values = [
+            int(self.maximum_volumes[i])
+            for i in self.group_members(group)
+            if i < len(self.maximum_volumes)
+        ]
+        return min(values) if values else None
 
 
 # Longest first, so "Deck Left" is not mistaken for a bare " L" form.
@@ -166,10 +219,33 @@ class SonanceHttpApi:
         return {i: str(v).lower() == "on" for i, v in enumerate(states)}
 
     async def topology(self) -> Topology:
-        """Read channel names and the authoritative channel-to-group map."""
-        data = await self._read(HTTP_PAGE_BASIC)
+        """Read the full channel layout from the In/Out Settings endpoint."""
+        data = await self._read(HTTP_PAGE_IN_OUT)
+
+        def strings(key: str) -> list[str]:
+            return [str(v).strip() for v in data.get(key) or []]
+
+        def ints(key: str) -> list[int]:
+            out: list[int] = []
+            for v in data.get(key) or []:
+                try:
+                    out.append(int(v))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
         return Topology(
-            output_names=[str(n).strip() for n in data.get("output-names") or []],
-            input_names=[str(n).strip() for n in data.get("input-names") or []],
-            output_groups=[str(g).strip() for g in data.get("output-groups") or []],
+            output_names=strings("output-names"),
+            input_names=strings("input-names"),
+            output_groups=strings("output-groups"),
+            dsp_presets=ints("dsp-presets"),
+            output_volumes=strings("output-volumes"),
+            turn_on_volumes=strings("turn-on-volumes"),
+            maximum_volumes=strings("maximum-volumes"),
+            gain_offset=strings("gain-offset"),
+            level_trim_dbs=strings("level-trim-dBs"),
+            stereo_or_mono=strings("stereo-or-mono"),
+            mode_sources=strings("mode-sources"),
+            sources_1=ints("sources-1"),
+            sources_2=ints("sources-2"),
         )
