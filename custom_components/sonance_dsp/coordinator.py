@@ -43,11 +43,13 @@ class SonanceData:
 class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
     """Polls the amplifier over TCP, with HTTP filling what TCP cannot answer.
 
-    Polling rather than push: nothing in the vendor documentation mentions
-    unsolicited messages and three independent third-party drivers all poll.
-    That is suggestive, not proven -- nobody has held a socket idle and moved
-    the front-panel control to see what arrives. If it turns out to push, the
-    entities do not need to change.
+    Polling rather than push, and that was tested rather than assumed: a socket
+    held idle across an out-of-band volume change received nothing, while a
+    control query on the same socket answered in 10 ms. See docs/protocol.md.
+
+    The one untested vector is audio sense, which is what the sibling Triad
+    device pushes. It would not change this: an audio-sense event says a source
+    woke up, not what the volume is.
     """
 
     def __init__(

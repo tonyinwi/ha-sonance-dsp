@@ -57,7 +57,15 @@ GET /Web/Handler.php?page=general-settings&action=read
 `firmware-version`, and network config. **Use `serial-number` as the config entry's
 `unique_id`** — the amp is typically on DHCP, so the IP is not stable identity.
 
-⚠️ There is also an `action=write` form. This integration does not use it, and must not.
+⚠️ There is also an `action=write` form. This integration does not use it — everything
+writable is writable over TCP, and TCP is where the reply can be correlated.
+
+Be precise about why, because the reason is narrower than it first looked. A
+`name=output-group` write was observed **returning unchanged JSON for a change it did not
+apply**, with the amplifier in standby. A `name=output-volume` write, by contrast, applies
+reliably — verified during the push experiment. So the endpoint is not broadly unreliable;
+one field is, and the safe rule is to read over HTTP and write over TCP rather than to
+model which fields can be trusted.
 
 ## Frame format
 
@@ -181,10 +189,34 @@ The vendor's power-on sequence is amp on → group on (200 ms) → query volume 
 rather than a bare group-on. Their power-off sends group-off **twice**, which suggests a
 single one proved unreliable.
 
+## Push: tested, and it does not
+
+**The amplifier sends nothing unsolicited when state is changed out of band.** Tested
+2026-09-20 on a DSP 8-130 MKII, firmware V2.2.8130:
+
+```
+idle baseline, 20s                      0 unsolicited frames
+out-of-band volume change over HTTP     0 unsolicited frames
+  (applied: output-volumes 6,7 -> -45)
+control query on the same socket        1 frame, 10 ms
+```
+
+The control step is the part that makes it a result rather than an absence. Without it,
+"zero frames" is indistinguishable from a reader that was never working — the query came
+back on the same socket that had just sat silent for forty seconds, so the socket was alive
+throughout and the silence was the amplifier's.
+
+The change was driven over HTTP and verified applied *before* the listening window, so
+nothing sent on the socket could be mistaken for a push.
+
+⚠️ **One vector remains untested: audio sense.** The sibling Triad AMS integration handles an
+unsolicited `AudioSense:Input[N]` frame, and this amplifier has the same sensing hardware —
+its `auto-on-method` is `Audio`. Triggering it needs audio to start or stop on an input.
+It would not change the design: an audio-sense event says a source woke up, not what the
+volume is, so state would still be polled.
+
 ## Still unverified
 
-- Whether the amp pushes unsolicited state when changed from the front panel or web UI.
-  Three independent third-party drivers all poll, which is suggestive but not proof.
 - Behaviour on a malformed frame or an out-of-range volume byte. No NAK format is documented
   anywhere.
 - Whether a group power change over TCP is reflected in the HTTP status page, and how fast.
