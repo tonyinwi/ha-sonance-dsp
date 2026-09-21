@@ -66,12 +66,40 @@ jobs:
             --cov-report=term-missing:skip-covered \
             --cov-report=xml
 
+      - name: Gate on config flow coverage
+        # The Bronze quality scale names config-flow-test-coverage specifically,
+        # and unlike a global percentage this is a threshold with a meaning:
+        # the flow is the first thing a user meets and its recovery paths are
+        # the ones nobody exercises by hand. Everything else is reported rather
+        # than gated, because a global number would only encode today's value
+        # and call it a standard.
+        run: |
+          python - <<'EOF'
+          import sys, xml.etree.ElementTree as ET
+          root = ET.parse("coverage.xml").getroot()
+          for cls in root.iter("class"):
+              if cls.get("filename", "").endswith("config_flow.py"):
+                  rate = float(cls.get("line-rate", 0))
+                  print(f"config_flow.py line coverage: {rate * 100:.1f}%")
+                  if rate < 1.0:
+                      missing = [
+                          line.get("number")
+                          for line in cls.iter("line")
+                          if line.get("hits") == "0"
+                      ]
+                      sys.exit(
+                          "config_flow.py must be 100% covered (Bronze "
+                          f"config-flow-test-coverage). Uncovered lines: {missing}"
+                      )
+                  break
+          else:
+              sys.exit("config_flow.py not found in the coverage report")
+          EOF
+
       - name: Coverage summary
         if: always()
-        # Reported, not gated. A threshold now would only encode today's number;
-        # the gate worth having is 100% on config_flow.py, which the Bronze
-        # quality scale requires and which we cannot claim until the config flow
-        # has tests at all.
+        # Reported, not gated -- see the config-flow gate above for the one
+        # threshold that carries a meaning rather than a number.
         run: |
           python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           import xml.etree.ElementTree as ET
