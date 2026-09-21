@@ -3,9 +3,12 @@
 Local control of Sonance DSP amplifiers over IP — per-zone volume, mute, source and power
 as `media_player` entities.
 
-> **Status: scaffolding.** The protocol is reverse-engineered, verified against real
-> hardware and documented in [`docs/protocol.md`](docs/protocol.md). The integration itself
-> is not implemented yet.
+> **Status: early.** Per-zone volume and mute work. The protocol is verified against real
+> hardware and documented in [`docs/protocol.md`](docs/protocol.md), and 111 unit tests
+> cover the client and the parsers — but the end-to-end criteria have not been checked on a
+> live install yet, so treat `v0.1.0` as a first cut rather than a finished integration.
+> Source selection, power, and the amp-level entity are not implemented; the integration
+> declares only the features it actually has.
 
 ## Why
 
@@ -61,6 +64,18 @@ The device range is −70 to +12 dB. Home Assistant's 0–100% maps onto −70 d
 
 The +12 dB ceiling is reachable but deliberately not the default: it is the factory turn-on
 level, and Sonance's own integrator notes flag it as a hazard. Raising it is a conscious act.
+
+## What works today
+
+| | |
+|---|---|
+| Zone discovery | Enumerated from the amplifier, cross-checked against its channel map |
+| Per-zone volume | Absolute set, verified working on firmware V2.2.8130 |
+| Per-zone mute | |
+| Per-zone maximum dB | Configurable, defaulting to 0 dB rather than the device's +12 dB ceiling |
+
+Not yet: source selection, power, the amp-level entity, diagnostics. See
+[`docs/roadmap.md`](docs/roadmap.md).
 
 ## Installation
 
