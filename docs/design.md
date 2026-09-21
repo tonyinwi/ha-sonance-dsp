@@ -131,13 +131,23 @@ limitation to engineer around, and it belongs in the troubleshooting docs.
 
 ## Polling, not push
 
-`iot_class` is `local_polling`. Nothing in the vendor documentation mentions unsolicited
-messages, and three independent third-party drivers all poll.
+`iot_class` is `local_polling`, and that is now **measured rather than inferred**.
 
-This is **untested rather than proven** — nobody has held a socket idle and changed the
-volume from the front panel to see what arrives. If the amplifier does push, switching to
-`local_push` is a small change and a large UX improvement. The coordinator is structured so
-that switch does not require rewriting the entities.
+A socket was held open and idle while the volume was changed out of band over HTTP. Twenty
+seconds of silence before the change, twenty after, and then a control query on the same
+socket answered in ten milliseconds — proving the reader worked the whole time and the
+silence belonged to the amplifier. See *Push: tested, and it does not* in
+[`protocol.md`](protocol.md).
+
+The earlier argument here was that three independent third-party drivers all poll, which was
+correctly labelled suggestive rather than proof. It happened to be right, but it is worth
+noting it was the weaker kind of evidence: the sibling Triad device, on the same OEM
+platform, *does* push one class of frame. Converging third-party behaviour is a hint about
+what implementers found necessary, not a statement about the hardware.
+
+One vector is still open — audio sense, which is what Triad's push actually reports. It
+would not change this decision: an audio-sense event says a source woke up, not what the
+volume is.
 
 ## Entity model
 

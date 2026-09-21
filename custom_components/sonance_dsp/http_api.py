@@ -7,9 +7,14 @@ tolerate it being unavailable. Losing it costs group power and device-supplied
 names; it must not cost volume control.
 
 It is read-only *by our choice*. An ``action=write`` form exists on the same
-endpoint and this integration never uses it -- everything writable is writable
-over TCP, and the HTTP write path was observed accepting a request it did not
-apply.
+endpoint and this integration never uses it: everything writable is writable
+over TCP, and TCP is where the reply can be correlated to the request.
+
+The reason is narrower than it once read here. A ``name=output-group`` write
+was seen returning unchanged JSON for a change it did not apply, with the
+amplifier in standby -- but a ``name=output-volume`` write applies reliably.
+One field misbehaves, not the endpoint. Read over HTTP, write over TCP, rather
+than maintaining a model of which fields can be trusted.
 """
 
 from __future__ import annotations
