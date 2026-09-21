@@ -30,6 +30,7 @@ from custom_components.sonance_dsp.const import (
 )
 from custom_components.sonance_dsp.protocol import (
     ForbiddenOpcodeError,
+    SonanceConnectionError,
     SonanceProtocol,
 )
 
@@ -484,3 +485,127 @@ async def test_discovery_must_not_credit_a_group_with_another_groups_late_reply(
         "labelled Group:A. The group letter in the reply is never checked "
         "against the group that was queried."
     )
+
+
+# ---------------------------------------------------------------------------
+# Shutdown and cancellation
+#
+# These cover the two invariants that keep the amplifier's SINGLE control
+# session recoverable. Both were fixed in response to a defect rather than
+# designed in, and neither had a test until now -- which is the whole reason
+# they are here: nothing stopped a refactor quietly undoing either one.
+# ---------------------------------------------------------------------------
+
+
+async def test_cancellation_mid_read_tears_the_socket_down() -> None:
+    """An outside cancel must not leave a reply on the wire.
+
+    ``asyncio.timeout`` converts a cancel into ``TimeoutError`` only when its
+    OWN deadline fired. A cancel from elsewhere -- Home Assistant cancelling a
+    coordinator refresh on reload, or a script stopped mid ``volume_set`` --
+    passes straight through the ``TimeoutError`` and ``OSError`` handlers.
+
+    ``readexactly`` does not consume its buffer until it holds all 50 bytes, so
+    if the socket stayed open the reply would land afterwards and be handed to
+    the NEXT command. That is the permanent one-ahead desync the whole design
+    exists to prevent, arriving through the one door that skips the reset.
+    """
+    # An empty script means the amplifier never answers, so the read stays
+    # parked in readexactly for us to cancel. Deliberately not a *delayed*
+    # reply: that would leave a timer outstanding past the end of the test,
+    # and the assertion here is about the socket, not about the reply.
+    link, patcher = fake_link({})
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        await client.connect()
+        assert client.is_connected
+
+        task = asyncio.create_task(client.get_volume(0))
+        await asyncio.sleep(0.05)  # let it reach readexactly
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        link.writer.close.assert_called()
+        assert not client.is_connected, (
+            "a cancelled read left the socket open; the in-flight reply will be "
+            "served to the next command"
+        )
+
+
+async def test_cancellation_does_not_leave_the_lock_held() -> None:
+    """A cancelled command must not wedge every later command.
+
+    The teardown runs inside the locked region. If cancellation escaped without
+    releasing the lock, the integration would look alive and answer nothing.
+    """
+    _link, patcher = fake_link({})
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        await client.connect()
+        task = asyncio.create_task(client.get_volume(0))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The lock is free, so a later command gets as far as reconnecting.
+        assert not client._lock.locked()
+
+
+async def test_disconnect_is_terminal() -> None:
+    """After disconnect(), a command raises instead of reopening the session.
+
+    Without this, a service call still queued on the lock at unload reopens the
+    amplifier's one session behind a client nothing will ever close again.
+    """
+    reply = padded("Cmd:Volume      ,Group:A Vol=-27 db")
+    _link, patcher = fake_link({query_volume_frame(0): reply})
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        await client.connect()
+        assert await client.get_volume(0) == -27
+        await client.disconnect()
+
+        with pytest.raises(SonanceConnectionError):
+            await client.get_volume(0)
+
+
+async def test_disconnect_during_connect_does_not_orphan_the_socket() -> None:
+    """disconnect() landing mid-connect must not leave a live socket behind.
+
+    disconnect() is lock-free by necessity -- _request calls _abort from inside
+    the locked region and asyncio.Lock is not reentrant -- so it can run while
+    another task is suspended in open_connection. It then reads self._writer as
+    None, closes nothing, and returns.
+
+    Before the fix the socket that opened a moment later was published onto a
+    client already closed for good, and nothing ever closed it. On an amplifier
+    that accepts exactly one control session, that orphan locks out every later
+    setup until Home Assistant restarts.
+    """
+    link = FakeLink({})
+    opened: list[MagicMock] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_open(*_args, **_kwargs):
+        started.set()
+        await release.wait()  # hold the connect open across the disconnect
+        opened.append(link.writer)
+        return link.reader, link.writer
+
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patch("asyncio.open_connection", slow_open):
+        connecting = asyncio.create_task(client.connect())
+        await started.wait()
+
+        await client.disconnect()  # lands while open_connection is suspended
+        release.set()
+
+        with pytest.raises(SonanceConnectionError):
+            await connecting
+
+    assert not client.is_connected
+    assert opened, "the test did not exercise the race it describes"
+    link.writer.close.assert_called(), "the orphaned socket was never closed"

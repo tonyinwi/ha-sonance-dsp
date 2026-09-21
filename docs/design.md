@@ -100,6 +100,19 @@ request therefore tears the socket down — including **cancellation from outsid
 `asyncio.timeout` does not convert into `TimeoutError` and which Home Assistant raises
 routinely when it cancels a coordinator refresh on reload.
 
+**Shutdown must never be re-entered as a connect.** `disconnect()` is lock-free by necessity,
+since a request calls the teardown from inside the locked region and `asyncio.Lock` is not
+reentrant. That means it can land while another task is suspended in `open_connection`, where
+it sees no writer to close and returns having closed nothing. The connect therefore re-checks
+the closed flag once the socket is up and discards it if so. Without that, the new socket is
+published onto a client already closed for good and nothing ever closes it — which on a device
+with one control session locks out every later setup until Home Assistant restarts.
+
+The sibling Triad AMS integration, built on what appears to be the same OEM platform, has the
+same hole in the same place and reaches it from the other direction: its shutdown path nulls the
+stream first, so the in-flight read fails as a *network* error and its worker dutifully
+reconnects a connection that was just told to stop.
+
 Connection loss is handled by **lazy reconnection**, not a backoff loop inside the client.
 A failed read tears the socket down; the next command reopens it. The retry cadence is
 therefore the coordinator's poll interval, and Home Assistant's own coordinator backoff

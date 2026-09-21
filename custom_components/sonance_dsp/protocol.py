@@ -157,14 +157,31 @@ class SonanceProtocol:
             return
         try:
             async with asyncio.timeout(CONNECT_TIMEOUT):
-                self._reader, self._writer = await asyncio.open_connection(
-                    self._host, self._port
-                )
+                reader, writer = await asyncio.open_connection(self._host, self._port)
         except (TimeoutError, OSError) as err:
             self._reader = self._writer = None
             raise SonanceConnectionError(
                 f"Could not connect to {self._host}:{self._port}: {err}"
             ) from err
+
+        # disconnect() is lock-free -- it has to be, because _request calls
+        # _abort from inside the locked region and asyncio.Lock is not
+        # reentrant. That means disconnect() can land while this coroutine is
+        # suspended in open_connection above: it reads self._writer as None,
+        # closes nothing, and returns. Without this re-check the socket that
+        # just opened would be published onto a client already closed for
+        # good, and nothing would ever close it.
+        #
+        # On this amplifier that is the worst leak available. It accepts one
+        # control session, so an orphaned socket locks out every later setup
+        # until Home Assistant restarts.
+        if self._closed:
+            writer.close()
+            raise SonanceConnectionError(
+                "Connection was closed while connecting; discarding the new socket"
+            )
+
+        self._reader, self._writer = reader, writer
         self._set_connected(True)
         _LOGGER.debug("Connected to %s:%s", self._host, self._port)
 
