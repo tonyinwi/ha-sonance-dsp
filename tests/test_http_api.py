@@ -35,6 +35,7 @@ from custom_components.sonance_dsp.http_api import (
     SonanceHttpApi,
     SonanceHttpError,
     Topology,
+    _strip_channel_suffix,
 )
 
 HOST = "192.0.2.10"
@@ -553,3 +554,58 @@ async def test_custom_http_port_is_honoured(amp: AiohttpClientMocker) -> None:
     _method, url, _data, _headers = amp.mock_calls[0]
     assert url.port == 8080
     assert url.query.get("action") == "read"
+
+
+# --- channel-suffix naming ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        # Installer-assigned: space-separated marker.
+        ("Patio L", "Patio"),
+        ("Patio R", "Patio"),
+        ("Deck Left", "Deck"),
+        ("Deck Right", "Deck"),
+        ("  Patio L  ", "Patio"),
+        # Factory default: marker runs straight onto the channel number.
+        ("Output 4L", "Output 4"),
+        ("Output 4R", "Output 4"),
+        ("Output 1L", "Output 1"),
+        # Names that merely END in L or R must be left alone -- this is the
+        # reason the digit guard exists.
+        ("Pool", "Pool"),
+        ("Hall", "Hall"),
+        ("Cellar", "Cellar"),
+        ("XLR", "XLR"),
+        ("Bar", "Bar"),
+        # No marker at all.
+        ("Kitchen", "Kitchen"),
+        ("", ""),
+    ],
+)
+def test_strip_channel_suffix(name: str, expected: str) -> None:
+    """Both naming conventions, without eating real names."""
+    assert _strip_channel_suffix(name) == expected
+
+
+def test_group_name_for_factory_default_channels() -> None:
+    """A pair of un-renamed channels collapses to a single zone name.
+
+    Before this, group D came through as "Output 4L" -- the left channel's
+    name standing in for the whole zone, because the two member names did not
+    match after stripping and the code fell back to the first member.
+    """
+    topology = Topology(
+        output_names=[
+            "Patio L", "Patio R",
+            "Output 2L", "Output 2R",
+            "Output 3L", "Output 3R",
+            "Output 4L", "Output 4R",
+        ],
+        input_names=[],
+        output_groups=["a", "a", "b", "b", "c", "c", "d", "d"],
+    )
+    assert topology.group_name(0) == "Patio"
+    assert topology.group_name(1) == "Output 2"
+    assert topology.group_name(3) == "Output 4"

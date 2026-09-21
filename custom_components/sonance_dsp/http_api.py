@@ -81,12 +81,27 @@ class Topology:
         return [i for i, g in enumerate(self.output_groups) if g.lower() == letter]
 
 
+# Longest first, so "Deck Left" is not mistaken for a bare " L" form.
+_CHANNEL_SUFFIXES = (" Right", " Left", " L", " R")
+
+
 def _strip_channel_suffix(name: str) -> str:
-    """Drop a trailing L/R channel marker from a channel name."""
+    """Drop a trailing L/R channel marker from a channel name.
+
+    Two conventions have to be handled. An installer-assigned name separates
+    the marker with a space -- ``Patio L`` -- while the amplifier's factory
+    default runs it straight onto the channel number: ``Output 4L``.
+
+    The second case is only stripped when a digit precedes the letter. Without
+    that guard, any zone whose name happens to end in L or R would lose its
+    last character: ``Pool``, ``Hall``, ``Cellar``, ``XLR``.
+    """
     stripped = name.strip()
-    for suffix in (" L", " R", " Left", " Right"):
+    for suffix in _CHANNEL_SUFFIXES:
         if stripped.endswith(suffix):
             return stripped[: -len(suffix)].strip()
+    if len(stripped) >= 2 and stripped[-1] in "LR" and stripped[-2].isdigit():
+        return stripped[:-1].strip()
     return stripped
 
 
