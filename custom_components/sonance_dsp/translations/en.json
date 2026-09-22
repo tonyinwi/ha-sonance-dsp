@@ -15,7 +15,7 @@
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the amplifier. Check the IP address and that nothing else holds a control connection — the amplifier accepts only one at a time.",
+      "cannot_connect": "Failed to connect to the amplifier. Check the IP address and that nothing else holds a control connection \u2014 the amplifier accepts only one at a time.",
       "unknown": "Unexpected error"
     },
     "abort": {
@@ -27,10 +27,22 @@
     "step": {
       "init": {
         "title": "Sonance DSP options",
-        "description": "The amplifier's range is -70 to +12 dB. The maximum below is the level reached at 100% on the volume slider. The default of 0 dB leaves +12 dB of headroom deliberately out of reach.",
+        "description": "The amplifier's range is -70 to +12 dB. The maximum below is the level reached at 100% on the volume slider; the default of 0 dB leaves +12 dB of headroom deliberately out of reach. The amplifier keeps its own per-channel ceiling too, and a zone is capped by whichever is lower.\n\nLinking a source to a media player lets a zone show what is playing on it. The amplifier only knows it is amplifying a line input; the player feeding that input is the only thing that knows the track.",
         "data": {
           "max_db": "Maximum volume (dB)",
-          "scan_interval": "Polling interval (seconds)"
+          "scan_interval": "Polling interval (seconds)",
+          "input_link_1": "Source 1 is fed by",
+          "input_link_2": "Source 2 is fed by",
+          "input_link_3": "Source 3 is fed by",
+          "input_link_4": "Source 4 is fed by"
+        },
+        "data_description": {
+          "input_link_1": "The media player connected to input 1. Its title, artist and artwork appear on any zone playing this source.",
+          "input_link_2": "The media player connected to input 2. Its title, artist and artwork appear on any zone playing this source.",
+          "input_link_3": "The media player connected to input 3. Its title, artist and artwork appear on any zone playing this source.",
+          "input_link_4": "The media player connected to input 4. Its title, artist and artwork appear on any zone playing this source.",
+          "max_db": "Level reached at 100% on the volume slider.",
+          "scan_interval": "How often to poll the amplifier."
         }
       }
     }
@@ -41,6 +53,9 @@
     },
     "not_connected": {
       "message": "Not connected to the amplifier."
+    },
+    "unknown_source": {
+      "message": "{source} is not an input on this amplifier. Available sources: {sources}."
     }
   }
 }

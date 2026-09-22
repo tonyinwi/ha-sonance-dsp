@@ -157,6 +157,16 @@ RE_AMP_POWER: Final = re.compile(r"Power\s+status\s*:\s*(\w+)")
 
 # --- Config entry / options ------------------------------------------------
 CONF_MAX_DB: Final = "max_db"
+# Maps a source number ("1".."4") to an upstream media_player entity_id. The
+# amplifier only knows it is amplifying a line input; the upstream player is
+# the only thing that knows what is actually playing.
+CONF_INPUT_LINKS: Final = "input_links"
+
+
+def input_link_key(source: int) -> str:
+    """Options-flow field name for one source's link."""
+    return f"input_link_{source}"
+
 CONF_SCAN_INTERVAL: Final = "scan_interval"
 DEFAULT_SCAN_INTERVAL: Final = 10
 MIN_SCAN_INTERVAL: Final = 5

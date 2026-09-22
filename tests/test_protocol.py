@@ -324,11 +324,17 @@ async def test_get_mute_parses_reply() -> None:
     assert link.frames == [FRAME_QUERY_MUTE_D]
 
 
-async def test_get_source_parses_number_and_name() -> None:
+async def test_get_source_returns_the_name_and_not_the_digit() -> None:
+    """``Src1=`` is a fixed label, so the digit must not be returned.
+
+    Selecting source 2 still answers ``Src1=``. A client that returned the
+    digit would report source 1 three times out of four; the NAME is the only
+    field that identifies which input is live.
+    """
     link, patcher = fake_link({FRAME_QUERY_SOURCE_D: padded(SOURCE_QUERY_REPLY)})
     client = SonanceProtocol("192.0.2.10", 52000)
     with patcher:
-        assert await client.get_source(3) == (2, "Streamer L Digital")
+        assert await client.get_source(3) == "Streamer L Digital"
     assert link.frames == [FRAME_QUERY_SOURCE_D]
 
 
@@ -365,7 +371,11 @@ async def test_one_connection_serves_many_queries() -> None:
     client = SonanceProtocol("192.0.2.10", 52000)
     with patcher:
         state = await client.read_group(3)
-    assert (state.volume_db, state.muted, state.source) == (-27, True, 2)
+    assert (state.volume_db, state.muted, state.source_name) == (
+        -27,
+        True,
+        "Streamer L Digital",
+    )
     assert link.open_connection.await_count == 1
 
 
@@ -609,3 +619,85 @@ async def test_disconnect_during_connect_does_not_orphan_the_socket() -> None:
     assert not client.is_connected
     assert opened, "the test did not exercise the race it describes"
     link.writer.close.assert_called(), "the orphaned socket was never closed"
+
+
+# ---------------------------------------------------------------------------
+# Padded replies
+#
+# Not every reply is one frame. A source CHANGE answers with 256 bytes: the
+# payload in the first 50 and 206 NUL bytes behind it, on opcodes 0x0A/0x0B/0x0C
+# but not 0x09. Measured on the device, in a single TCP segment.
+# ---------------------------------------------------------------------------
+
+
+def source_frame(source: int, group: int) -> bytes:
+    return bytes((0xFF, 0x55, 0x02, 0x08 + source, group))
+
+
+async def test_set_source_drains_the_padding_behind_its_reply() -> None:
+    """The 206 NUL bytes must not be left for the next four commands.
+
+    Without the drain they are read as replies: four commands in a row see
+    pure padding, decode to nothing, and look exactly like "no reply" -- which
+    on a query means "this group has no channels".
+    """
+    padded_reply = padded("Cmd:Source2     , Group:D") + b"\x00" * 206
+    _link, patcher = fake_link(
+        {
+            source_frame(2, 3): padded_reply,
+            query_volume_frame(3): padded("Cmd:Volume      ,Group:D Vol=-27 db"),
+        }
+    )
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        await client.connect()
+        await client.set_source(3, 2)
+
+        # The very next command must get its OWN reply, not leftover padding.
+        assert await client.get_volume(3) == -27
+
+
+async def test_unpadded_reply_costs_nothing_extra() -> None:
+    """Selecting source 1 replies with a bare 50 bytes; the drain must cope."""
+    _link, patcher = fake_link(
+        {
+            source_frame(1, 3): padded("Cmd:Source1     , Group:D"),
+            query_volume_frame(3): padded("Cmd:Volume      ,Group:D Vol=-27 db"),
+        }
+    )
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        await client.connect()
+        await client.set_source(3, 1)
+        assert await client.get_volume(3) == -27
+
+
+async def test_non_padding_leftovers_reset_the_connection() -> None:
+    """Trailing bytes that are not NUL mean a real frame was left behind.
+
+    That is a genuine desync rather than padding, and continuing would read
+    someone else's reply as the next answer.
+    """
+    trailing = padded("Cmd:Source2     , Group:D") + padded(
+        "Cmd:Volume      ,Group:A Vol=-40 db"
+    )
+    _link, patcher = fake_link({source_frame(2, 3): trailing})
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        await client.connect()
+        with pytest.raises(SonanceConnectionError, match="out of step"):
+            await client.set_source(3, 2)
+        assert not client.is_connected
+
+
+@pytest.mark.parametrize("source", [0, 5, -1])
+async def test_set_source_rejects_out_of_range_before_the_socket(
+    source: int,
+) -> None:
+    link, patcher = fake_link({})
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        await client.connect()
+        with pytest.raises(ValueError):
+            await client.set_source(0, source)
+        assert link.frames == []

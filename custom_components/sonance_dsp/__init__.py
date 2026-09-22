@@ -72,5 +72,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: SonanceConfigEntry) -> 
     """
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        await entry.runtime_data.async_close()
+        # runtime_data is normally set, because Home Assistant only unloads an
+        # entry whose setup returned True. Not assuming it is set matters
+        # anyway: an AttributeError here fails the unload, and a failed unload
+        # leaves the entry stuck -- still holding the amplifier's one control
+        # session, which is the exact thing this function exists to release.
+        coordinator = getattr(entry, "runtime_data", None)
+        if coordinator is not None:
+            await coordinator.async_close()
+        else:
+            _LOGGER.debug("Unloading an entry that was never fully set up")
     return unload_ok

@@ -142,6 +142,43 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
     def group_name(self, group: int) -> str | None:
         return self._topology.group_name(group) if self._topology else None
 
+    def input_names(self) -> list[str]:
+        return self._topology.input_names if self._topology else []
+
+    def source_number_for_input_name(self, name: str) -> int | None:
+        """Resolve a source name to its 1-based number.
+
+        Goes through the topology rather than the TCP reply because the reply's
+        ``Src1=`` digit is a fixed label -- it stays 1 whatever is selected.
+        Returns None when the channel layout could not be read at all, which is
+        the one case where source selection has to be unavailable rather than
+        wrong.
+        """
+        if self._topology is None:
+            return None
+        return self._topology.source_number_for_input_name(name)
+
+    def maximum_db(self, group: int) -> int | None:
+        """The amplifier's own ceiling for a group, if it reported one."""
+        return self._topology.maximum_db(group) if self._topology else None
+
+    def gain_offset(self, group: int) -> int | None:
+        """Installer gain trim for a group, in dB, if the members agree."""
+        if self._topology is None:
+            return None
+        values = []
+        for i in self._topology.group_members(group):
+            if i < len(self._topology.gain_offset):
+                try:
+                    values.append(int(self._topology.gain_offset[i]))
+                except ValueError:
+                    return None
+        if not values or len(set(values)) != 1:
+            # Left and right trimmed differently is a real possibility and not
+            # something a single zone-level number can represent honestly.
+            return None
+        return values[0]
+
     async def _async_update_data(self) -> SonanceData:
         try:
             groups = {g: await self.client.read_group(g) for g in self.groups}

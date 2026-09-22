@@ -15,12 +15,15 @@ from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import (
+    EntitySelector,
+    EntitySelectorConfig,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
 )
 
 from .const import (
+    CONF_INPUT_LINKS,
     CONF_MAX_DB,
     CONF_SCAN_INTERVAL,
     DEFAULT_HTTP_PORT,
@@ -32,6 +35,8 @@ from .const import (
     MAX_VOLUME_DB,
     MIN_SCAN_INTERVAL,
     MIN_VOLUME_DB,
+    SOURCE_COUNT,
+    input_link_key,
 )
 from .http_api import AmplifierIdentity, SonanceHttpApi, SonanceHttpError
 from .protocol import SonanceConnectionError, SonanceProtocol
@@ -45,8 +50,14 @@ STEP_USER_SCHEMA = vol.Schema(
     }
 )
 
-OPTIONS_SCHEMA = vol.Schema(
-    {
+def _options_schema() -> vol.Schema:
+    """Volume/polling options, plus one upstream link per source.
+
+    The links are what let a zone show what is playing. The amplifier only
+    knows it is amplifying line input 2; the player feeding that input is the
+    only thing that knows the track.
+    """
+    fields: dict[Any, Any] = {
         vol.Optional(CONF_MAX_DB, default=DEFAULT_MAX_DB): NumberSelector(
             NumberSelectorConfig(
                 min=MIN_VOLUME_DB + 1,
@@ -68,7 +79,11 @@ OPTIONS_SCHEMA = vol.Schema(
             )
         ),
     }
-)
+    for source in range(1, SOURCE_COUNT + 1):
+        fields[vol.Optional(input_link_key(source))] = EntitySelector(
+            EntitySelectorConfig(domain="media_player")
+        )
+    return vol.Schema(fields)
 
 
 async def async_read_identity(
@@ -153,15 +168,28 @@ class SonanceOptionsFlow(OptionsFlowWithReload):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         if user_input is not None:
+            links = {
+                str(source): entity
+                for source in range(1, SOURCE_COUNT + 1)
+                if (entity := user_input.get(input_link_key(source)))
+            }
             return self.async_create_entry(
                 data={
                     CONF_MAX_DB: int(user_input[CONF_MAX_DB]),
                     CONF_SCAN_INTERVAL: int(user_input[CONF_SCAN_INTERVAL]),
+                    CONF_INPUT_LINKS: links,
                 }
             )
+
+        # The stored links are a dict keyed by source number; the form wants
+        # them flattened back into one field per source.
+        current = dict(self.config_entry.options)
+        for source, entity in (current.pop(CONF_INPUT_LINKS, None) or {}).items():
+            current[input_link_key(int(source))] = entity
+
         return self.async_show_form(
             step_id="init",
             data_schema=self.add_suggested_values_to_schema(
-                OPTIONS_SCHEMA, self.config_entry.options
+                _options_schema(), current
             ),
         )
