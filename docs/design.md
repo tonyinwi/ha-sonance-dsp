@@ -289,57 +289,79 @@ Every rule below is measured behaviour; see *Power* in [`protocol.md`](protocol.
   clears its mute. The mute is read from the amplifier while the zone is still off -- it
   keeps it -- and sent straight after the zone-on, the two frames under one hold of the
   protocol lock so nothing can queue between them. Whether a mute sent that soon survives
-  the clear is unmeasured, so it is read back at 0.3, 0.6, 1.0 and 1.5 s and re-sent
-  whenever it reads off. If the read before switching on fails, the last polled value is
-  used; if there is none, the zone comes on muted. A zone someone muted stays muted until
-  someone unmutes it.
+  the clear is unmeasured, so it is read back at 0.3, 0.6, 1.0 and 1.5 s -- to 5 s straight
+  after a wake, when a zone may power up late -- and anything but a confirmed "muted",
+  including no answer, is met with another mute. It must end on a confirmed read or the
+  switch-on counts as failed (below). If the read before switching on fails, the last
+  polled value is used; if there is none, the zone comes on muted. A zone someone muted
+  stays muted until someone unmutes it.
 - **A switch-on that breaks part-way leaves the zone silent.** If any step after the
-  zone-on fails -- an echo that never arrives, a mute that cannot be delivered -- the zone
-  is muted again, and switched off if even that fails, and its power is shown as unknown
-  rather than off. The error is still raised. A caller cancelled before anything was
-  switched cancels the request; one cancelled after the zone-on does not stop it.
+  zone-on fails -- an echo that never arrives, a mute that cannot be confirmed -- the zone
+  is muted again and that is checked the same way; if it still cannot be confirmed the zone
+  is switched off, and muted once more while off. The mute is then *owed*: the next
+  switch-on restores it whatever the amplifier reports, until a restore is confirmed or
+  someone sets the mute themselves. What is shown afterwards is what the status page says,
+  and the mute as unknown when it is. The error is still raised. A zone-on that never left
+  -- no connection to send it on -- is the one failure that proves nothing happened, and it
+  changes nothing. A caller cancelled before anything was switched cancels the request;
+  one cancelled after the zone-on does not stop it, and if it then fails, the log says so.
 - **Turning on a zone that is already on does nothing.** Scenes and
   `homeassistant.turn_on` call `turn_on` without checking, and whether a zone-on resets a
   playing zone to its turn-on volume is unmeasured. It is judged from a fresh amplifier
-  read plus the status page, or the last known zone power when the page is down. If the
-  amplifier's own power cannot be read after three tries, nothing is switched at all:
-  guessing is how zones nobody asked for start playing.
+  read plus the status page, or the last known zone power when the page is down.
+- **Unknown is not guessed.** If the amplifier's own power cannot be read after three
+  tries, nothing is switched: a power-on to an amp already on was never measured. If the
+  amp is on but the zone's power is unknown -- status page down past the carry-forward
+  bound -- the zone is not switched on either: it may be playing, and a zone-on may reset
+  its volume. *This one is a choice, not a necessity.* It blocks turning zones on during a
+  long status-page outage; the alternative is to send the zone-on and accept the unmeasured
+  risk. Measuring a zone-on to a zone already on would settle it.
 - **Waking brings back only the zone asked for.** A wake revives every zone whose flag
   survived standby -- every zone that was on when something other than Home Assistant
   put the amp to sleep. They are all shown off while it sleeps, so turning one on must not
   bring back three: flagged zones, the requested one included, are switched off before the
-  wake and again after it. The requested zone's zone-on is then always the measured
-  off-to-on case, which applies its turn-on volume. A revived zone that cannot be switched
-  off is shown as on (or unknown), never off, and the error is raised.
+  wake and again after it, whatever standby appeared to say. The requested zone's zone-on
+  is then always the measured off-to-on case, which applies its turn-on volume. If standby
+  does not answer a zone-off at all, the rest wait for the wake rather than each waiting
+  out a timeout. A power-on whose echo is lost is waited on anyway, so the clean-up still
+  runs. A revived zone that cannot be switched off is shown as on (or unknown), never off,
+  and the error is raised.
 - **Waking waits for the boot, and so does everything else.** From standby, turn-on sends
   power-on and then nothing but status queries until the amplifier reports `On` (~10 s).
   Every write holds the coordinator's command lock for its whole duration, and a power
   change holds it throughout -- `PARALLEL_UPDATES` alone is not enough, because Assist's
   relative-volume intent calls entity methods directly. Volume up and down read the
   current level from the amplifier inside the lock, so a step that waited starts from the
-  turn-on volume, and a stale cache never turns a step into a jump. Assist's *percentage*
-  step computes its target from `volume_level` before it reaches the lock, so an off zone
-  reports no `volume_level` and that form fails instead of jumping. Several zones switched
-  on together share one wake. A wake that times out is not retried for a minute, or until
-  a poll finds the amplifier on, and the holdoff is checked before anything is sent.
+  turn-on volume, and a stale cache never turns a step into a jump; without a reading, a
+  step up past the ceiling is refused. Assist's *percentage* step computes its target from
+  `volume_level` before it reaches the lock, so a zone that is off -- or whose level has not
+  been read since it was switched on -- reports no `volume_level`, and HA's handler fails
+  with an error instead of jumping. Several zones switched on together share one wake. A
+  wake that times out is not retried for a minute, or until a poll finds the amplifier on,
+  and the holdoff is checked before anything is sent.
 - **The status page is not waited on twice.** Inside a power change each read is bounded
   at three seconds -- it answers in well under a tenth of one -- and after one failure the
   rest of that change does without it.
 - **Polls do not overwrite what a command just set.** A poll does not start while a
   command holds the lock, and one already reading when a change lands discards its own
   results, which predate it. A skipped poll after a failed one still counts as failed.
-- **The last zone off puts the amplifier in standby.** It does not do this itself. Standby
-  is sent whatever the cached state says, since the cache can be stale. When the status
-  page is unreachable there is no knowing whether another zone is still on, so the
-  amplifier is left alone rather than risk silencing it. Turning off a zone in a sleeping
-  amplifier is best effort -- it is already silent -- and what is shown is what the status
-  page then says.
+- **One blip does not make a zone ignore turn_off.** Home Assistant silently skips an
+  unavailable entity in a service call, so a poll whose reads fail asks again on a fresh
+  connection before calling the amplifier unreachable, and after an outright failure the
+  next poll comes in five seconds rather than a whole interval.
+- **The last zone off puts the amplifier in standby.** It does not do this itself. A
+  zone-off that gets no answer is checked on the status page -- it may have landed -- and
+  sent once more. Standby is sent whatever the cached state says, since the cache can be
+  stale. When the status page is unreachable there is no knowing whether another zone is
+  still on, so the amplifier is left alone rather than risk silencing it. Turning off a
+  zone in a sleeping amplifier is best effort -- it is already silent -- and what is shown
+  is what the status page then says, or unknown without it.
 - **Power and mute writes are acknowledged by their own echo.** Each is checked against
   the command and the group it was for, as recorded from the device; a frame of padding or
   another group's reply is a desync, not an acknowledgement. With the status page down the
   echo is the only confirmation there is.
 - **Power changes are confirmed on the status page** and the command is retried once.
-- **Unload waits for a power change in progress**, up to the wake timeout plus ten
+- **Unload waits for a power change in progress**, up to the wake timeout plus fifteen
   seconds, and refuses anything queued behind it. Cutting one off mid-wake would leave the
   zones the wake revived playing.
 - **Switching on applies the zone's turn-on volume**, a fixed level or `LAST` depending on

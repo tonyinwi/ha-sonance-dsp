@@ -233,7 +233,13 @@ class SonanceHttpApi:
         states = data.get(key)
         if not isinstance(states, list) or not states:
             raise SonanceHttpError(f"Status page reply has no {key} list")
-        return {i: str(v).lower() == "on" for i, v in enumerate(states)}
+        # Only "on" and "off" mean anything. Any other value leaves that group
+        # out -- unknown -- rather than reading it as off.
+        return {
+            i: str(v).lower() == "on"
+            for i, v in enumerate(states)
+            if str(v).lower() in ("on", "off")
+        }
 
     async def topology(self) -> Topology:
         """Read the full channel layout from the In/Out Settings endpoint."""

@@ -286,11 +286,20 @@ signal by itself, and in `Audio Green` it also drops the network while asleep.
 
 | Command | Reply | Notes |
 |---|---|---|
-| `FF 55 02 65 <N>` zone on | `Cmd:GroupON ,Group:X` | one command is enough |
-| `FF 55 02 66 <N>` zone off | `Cmd:GroupOFF ,Group:X` | the Savant profile sends this twice; not needed here |
+| `FF 55 02 65 <N>` zone on | `Cmd:GroupON      ,Group:X` | one command is enough |
+| `FF 55 02 66 <N>` zone off | `Cmd:GroupOFF      ,Group:X` | the Savant profile sends this twice; not needed here |
+| `FF 55 02 07 <N>` mute on | `Cmd:MuteOn      , Group:X` | note the space after the comma |
+| `FF 55 02 08 <N>` mute off | `Cmd:MuteOff     , Group:X` | |
 | `FF 55 01 01` amp on | `Cmd:PowerOn` | starts a ~10 s boot |
 | `FF 55 01 02` amp standby | `Cmd:PowerOff` | network stays up |
 | `FF 55 01 70` amp query | `Power status :On` / `:Off` | the only master-power read |
+
+The echoes above are verbatim, padding included, as captured on 2026-09-26. The
+integration checks every power and mute write against its own echo -- command and
+group letter -- because with the status page down the echo is the only confirmation
+there is, and a frame of padding or another group's late reply is not one. Any word
+in the amplifier-power reply other than `On` or `Off`, and any status-page power
+value other than `on` or `off`, is read as unknown, never as off.
 
 What each command actually does:
 

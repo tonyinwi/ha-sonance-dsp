@@ -31,6 +31,7 @@ from custom_components.sonance_dsp.const import (
 from custom_components.sonance_dsp.protocol import (
     ForbiddenOpcodeError,
     SonanceConnectionError,
+    SonanceNotSentError,
     SonanceProtocol,
 )
 
@@ -711,11 +712,13 @@ async def test_set_source_rejects_out_of_range_before_the_socket(
 GROUP_ON_ECHO_A = "Cmd:GroupON      ,Group:A"
 GROUP_OFF_ECHO_D = "Cmd:GroupOFF      ,Group:D"
 MUTE_ON_ECHO_A = "Cmd:MuteOn      , Group:A"
+MUTE_OFF_ECHO_D = "Cmd:MuteOff     , Group:D"
 POWER_ON_ECHO = "Cmd:PowerOn"
 
 FRAME_GROUP_ON_A = b"\xff\x55\x02\x65\x00"
 FRAME_GROUP_OFF_D = b"\xff\x55\x02\x66\x03"
 FRAME_MUTE_ON_A = b"\xff\x55\x02\x07\x00"
+FRAME_MUTE_OFF_D = b"\xff\x55\x02\x08\x03"
 FRAME_POWER_ON = b"\xff\x55\x01\x01"
 
 
@@ -725,9 +728,10 @@ FRAME_POWER_ON = b"\xff\x55\x01\x01"
         (lambda c: c.set_group_power(0, True), FRAME_GROUP_ON_A, GROUP_ON_ECHO_A),
         (lambda c: c.set_group_power(3, False), FRAME_GROUP_OFF_D, GROUP_OFF_ECHO_D),
         (lambda c: c.set_mute(0, True), FRAME_MUTE_ON_A, MUTE_ON_ECHO_A),
+        (lambda c: c.set_mute(3, False), FRAME_MUTE_OFF_D, MUTE_OFF_ECHO_D),
         (lambda c: c.set_amp_power(True), FRAME_POWER_ON, POWER_ON_ECHO),
     ],
-    ids=["group_on", "group_off", "mute_on", "power_on"],
+    ids=["group_on", "group_off", "mute_on", "mute_off", "power_on"],
 )
 async def test_a_write_accepts_its_recorded_echo(call, frame: bytes, echo: str) -> None:
     link, patcher = fake_link({frame: padded(echo)})
@@ -758,6 +762,71 @@ async def test_a_write_answered_by_anything_else_is_not_acknowledged(
         await client.set_group_power(0, True)
     # Out of step: the socket is reset, as for any desync.
     assert not client.is_connected
+
+
+@pytest.mark.parametrize(
+    ("call", "frame", "wrong"),
+    [
+        (lambda c: c.set_mute(0, True), FRAME_MUTE_ON_A, "Cmd:MuteOff     , Group:A"),
+        (lambda c: c.set_mute(3, False), FRAME_MUTE_OFF_D, "Cmd:MuteOff     , Group:B"),
+        (lambda c: c.set_amp_power(True), FRAME_POWER_ON, "Cmd:PowerOff"),
+        (lambda c: c.set_group_power(3, False), FRAME_GROUP_OFF_D, MUTE_OFF_ECHO_D),
+    ],
+    ids=["mute_on_opposite", "mute_off_other_group", "power_opposite", "stray"],
+)
+async def test_every_checked_write_rejects_a_wrong_echo(
+    call, frame: bytes, wrong: str
+) -> None:
+    _link, patcher = fake_link({frame: padded(wrong)})
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher, pytest.raises(SonanceConnectionError):
+        await call(client)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        {FRAME_GROUP_ON_A: padded(GROUP_ON_ECHO_A), FRAME_MUTE_ON_A: NUL_REPLY},
+        {
+            FRAME_GROUP_ON_A: padded(GROUP_ON_ECHO_A),
+            FRAME_MUTE_ON_A: padded("Cmd:MuteOn      , Group:C"),
+        },
+    ],
+    ids=["mute_padding", "mute_other_group"],
+)
+async def test_switch_on_muted_checks_the_mute_echo_too(script: dict) -> None:
+    _link, patcher = fake_link(script)
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher, pytest.raises(SonanceConnectionError):
+        await client.set_group_power_muted(0)
+
+
+async def test_a_write_with_no_connection_is_reported_as_not_sent() -> None:
+    """The one failure that proves the command had no effect."""
+    refused = AsyncMock(side_effect=OSError("connection refused"))
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patch("asyncio.open_connection", refused), pytest.raises(
+        SonanceNotSentError
+    ):
+        await client.set_group_power_muted(0)
+    # The mute was not attempted: it would only wait out another connect.
+    assert refused.await_count == 1
+
+
+async def test_a_write_after_disconnect_is_reported_as_not_sent() -> None:
+    client = SonanceProtocol("192.0.2.10", 52000)
+    await client.disconnect()
+    with pytest.raises(SonanceNotSentError):
+        await client.set_group_power(0, True)
+
+
+@pytest.mark.parametrize("word", ["Standby", "Booting", "1"])
+async def test_an_unrecognised_amp_power_word_is_unknown(word: str) -> None:
+    """Not standby: reading it as standby would show playing zones OFF."""
+    _link, patcher = fake_link({FRAME_AMP_POWER_QUERY: padded(f"Power status :{word}")})
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        assert await client.get_amp_power() is None
 
 
 async def test_switch_on_muted_sends_both_frames_back_to_back() -> None:

@@ -266,6 +266,15 @@ async def test_group_power_absent_is_the_page_not_answering(
         await api.group_power()
 
 
+async def test_an_unrecognised_power_value_is_unknown_not_off(
+    amp: AiohttpClientMocker, api: SonanceHttpApi
+) -> None:
+    """Read as off, it would tell turn_off that no other zone is playing."""
+    amp.get(STATUS, json={"power-status": ["on", "standby", "off", ""]})
+
+    assert await api.group_power() == {0: True, 2: False}
+
+
 async def test_group_mute_maps_on_off_to_bools(
     amp: AiohttpClientMocker, api: SonanceHttpApi
 ) -> None:

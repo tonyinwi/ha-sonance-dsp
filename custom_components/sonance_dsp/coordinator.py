@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
+from functools import partial
 from typing import NoReturn
 
 from homeassistant.config_entries import ConfigEntry
@@ -30,6 +32,8 @@ from .const import (
     GROUP_POWER_STALE_AFTER,
     MAX_GROUPS,
     MUTE_VERIFY_DELAYS,
+    MUTE_VERIFY_DELAYS_AFTER_WAKE,
+    POLL_RETRY_AFTER,
     POWER_CONFIRM_INTERVAL,
     POWER_CONFIRM_TIMEOUT,
     WAKE_POLL_INTERVAL,
@@ -41,6 +45,7 @@ from .protocol import (
     GroupState,
     SonanceConnectionError,
     SonanceError,
+    SonanceNotSentError,
     SonanceProtocol,
 )
 
@@ -58,6 +63,10 @@ class SonanceData:
     groups: dict[int, GroupState] = field(default_factory=dict)
     group_power: dict[int, bool] = field(default_factory=dict)
     amp_power: bool | None = None
+
+
+# Marks "leave this field as it is" where None itself means "unknown".
+_UNCHANGED = object()
 
 
 class _PowerOp:
@@ -130,6 +139,11 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         self._amp_power_misses = 0
         self._wake_failed_at: float | None = None
         self._closing = False
+        # Zones whose mute a failed switch-on may have cleared on the amp, and
+        # which must come back muted however the amp reports them.
+        self._mute_owed: set[int] = set()
+        # Zones whose cached volume may predate their last switch-on.
+        self._volume_unverified: set[int] = set()
 
     async def async_discover(self) -> None:
         """Enumerate populated groups and read the channel layout.
@@ -191,6 +205,8 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         if current is None:
             return
         self.data.groups[group] = replace(current, **fields)
+        if fields.get("volume_db") is not None:
+            self._volume_unverified.discard(group)
         self._generation += 1
         self.async_set_updated_data(self.data)
 
@@ -250,10 +266,18 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         generation = self._generation
 
         try:
-            groups = {g: await self.client.read_group(g) for g in self.groups}
-            amp_power = self._bridge_amp_power(await self._async_read_amp_power())
-        except SonanceConnectionError as err:
-            raise UpdateFailed(f"Amplifier unreachable: {err}") from err
+            groups, amp_power = await self._async_read_tcp()
+        except SonanceConnectionError:
+            # One late reply tears the socket down, and Home Assistant silently
+            # skips an unavailable entity in a service call -- so one blip
+            # would turn a turn_off into a no-op for a whole interval. Ask
+            # again on a fresh connection before calling the amp unreachable.
+            try:
+                groups, amp_power = await self._async_read_tcp()
+            except SonanceConnectionError as err:
+                raise UpdateFailed(
+                    f"Amplifier unreachable: {err}", retry_after=POLL_RETRY_AFTER
+                ) from err
 
         group_power: dict[int, bool] = {}
         try:
@@ -281,6 +305,9 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
             _LOGGER.debug("A change landed during the poll; keeping it")
             return self.data
 
+        self._volume_unverified -= {
+            g for g, state in groups.items() if state.volume_db is not None
+        }
         return SonanceData(
             identity=self.identity,
             topology=self._topology,
@@ -288,6 +315,11 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
             group_power=group_power,
             amp_power=amp_power,
         )
+
+    async def _async_read_tcp(self) -> tuple[dict[int, GroupState], bool | None]:
+        groups = {g: await self.client.read_group(g) for g in self.groups}
+        amp_power = self._bridge_amp_power(await self._async_read_amp_power())
+        return groups, amp_power
 
     @property
     def _group_power_stale_after(self) -> float:
@@ -347,11 +379,27 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         """
         op = _PowerOp()
         task = asyncio.ensure_future(self._async_turn_on(group, op))
+        task.add_done_callback(partial(self._log_if_abandoned, group, op))
         try:
-            await asyncio.shield(task)
+            # wait() rather than shield(): the task is not cancelled with the
+            # caller either way, and its outcome is reported below rather than
+            # as an anonymous "exception in shielded future".
+            await asyncio.wait((task,))
         except asyncio.CancelledError:
             op.abandoned = True
             raise
+        task.result()
+
+    @staticmethod
+    def _log_if_abandoned(group: int, op: _PowerOp, task: asyncio.Task[None]) -> None:
+        if task.cancelled() or not op.abandoned:
+            return
+        if (err := task.exception()) is not None:
+            _LOGGER.warning(
+                "Switching zone %s on failed after the request was cancelled: %s",
+                GROUP_LETTERS[group],
+                err,
+            )
 
     async def _async_turn_on(self, group: int, op: _PowerOp) -> None:
         async with self.command_lock:
@@ -368,34 +416,50 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                     translation_domain=DOMAIN,
                     translation_key="amp_power_unknown",
                 )
+            if op.abandoned:
+                return
             fresh = await self._async_read_group_power(op)
             flags = fresh
             if flags is None and self.data is not None:
                 flags = self.data.group_power
 
-            if amp_on and flags and flags.get(group):
-                # Already on. Scenes and homeassistant.turn_on call this without
-                # checking, and a zone-on to a playing zone may reset it to its
-                # turn-on volume. Refresh what is shown and leave it alone.
-                self._apply_power(
-                    group,
-                    zone_on=True,
-                    amp_on=True,
-                    power=flags,
-                    volume_db=await self._async_read_volume(group),
-                    muted=await self.client.get_mute(group),
-                )
-                return
+            if amp_on:
+                zone = flags.get(group) if flags else None
+                if zone:
+                    # Already on. Scenes and homeassistant.turn_on call this
+                    # without checking, and a zone-on to a playing zone may
+                    # reset it to its turn-on volume. Refresh and leave it.
+                    self._apply_power(
+                        group,
+                        zone_on=True,
+                        amp_on=True,
+                        power=flags,
+                        volume_db=await self._async_read_volume(group),
+                        muted=await self.client.get_mute(group),
+                    )
+                    return
+                if zone is None:
+                    # The amp is on and nothing says whether this zone is: the
+                    # status page is down and the last reading has expired. It
+                    # may be playing, and a zone-on may reset it.
+                    raise HomeAssistantError(
+                        translation_domain=DOMAIN,
+                        translation_key="zone_power_unknown",
+                        translation_placeholders={"zone": GROUP_LETTERS[group]},
+                    )
 
-            switched_off: list[int] = []
+            known_off: set[int] = set()
             if not amp_on:
                 self._check_wake_holdoff()
-                switched_off = await self._async_wake_only(group, fresh, op)
+                woke = await self._async_wake_only(group, fresh, op)
+                if woke is None:
+                    return  # abandoned before anything but zone-offs was sent
+                known_off = woke
                 if op.abandoned:
                     # Awake, and the zones the wake revived are off again, but
                     # nobody wants this zone on any more.
                     self._publish_power(
-                        switched_off,
+                        known_off,
                         amp_on=True,
                         group_power=await self._async_read_group_power(op),
                     )
@@ -404,27 +468,43 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
             restore = self._mute_to_restore(group, await self.client.get_mute(group))
             if op.abandoned:
                 return
-            await self._async_switch_on(group, restore, op, switched_off)
+            await self._async_switch_on(
+                group, restore, op, known_off, after_wake=not amp_on
+            )
 
     async def _async_switch_on(
-        self, group: int, restore: bool, op: _PowerOp, switched_off: list[int]
+        self,
+        group: int,
+        restore: bool,
+        op: _PowerOp,
+        known_off: set[int],
+        *,
+        after_wake: bool,
     ) -> None:
         """Send the zone-on, restore and verify the mute, and publish.
 
         From the first zone-on onwards nothing is abandoned, and any failure
         leaves the zone silent rather than playing: if the sequence breaks with
-        the mute not yet confirmed, the zone is muted again, and switched off
-        if even that cannot be delivered.
+        the mute not yet confirmed, the zone is muted again and that checked,
+        and switched off if even that cannot be done.
         """
         power: dict[int, bool] | None = None
+        sent = False
         try:
             for attempt in (1, 2):
-                if restore:
-                    # Zone-on and mute together, every time -- including a
-                    # retry's, since every zone-on clears the mute.
-                    await self.client.set_group_power_muted(group)
-                else:
-                    await self.client.set_group_power(group, True)
+                try:
+                    if restore:
+                        # Zone-on and mute together, every time -- including a
+                        # retry's, since every zone-on clears the mute.
+                        await self.client.set_group_power_muted(group)
+                    else:
+                        await self.client.set_group_power(group, True)
+                except SonanceNotSentError:
+                    raise
+                except SonanceError:
+                    sent = True
+                    raise
+                sent = True
                 power, confirmed = await self._async_await_group_power(
                     group, on=True, op=op
                 )
@@ -434,29 +514,29 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                     self._log_retry(group, on=True)
             else:
                 if restore:
-                    await self._async_verify_mute(group)
+                    await self._async_verify_mute(group, after_wake=after_wake)
                 self._raise_not_confirmed(group, on=True)
             if restore:
-                await self._async_verify_mute(group)
+                await self._async_verify_mute(group, after_wake=after_wake)
+        except SonanceNotSentError:
+            if sent:
+                await self._async_fail_safe(group, restore, op, known_off)
+            else:
+                # Nothing reached the amplifier: the zone is as it was.
+                self._publish_power(known_off, amp_on=True)
+            raise
         except SonanceError:
-            silenced = await self._async_force_silent(group) if restore else None
-            # Whether the zone is on is now unknown: say so rather than
-            # leaving it showing off while it may be playing.
-            unknown = dict(self.data.group_power) if self.data is not None else {}
-            for other in switched_off:
-                unknown[other] = False
-            unknown.pop(group, None)
-            self._publish_power(
-                [], amp_on=True, group_power=unknown, group=group, muted=silenced
-            )
+            await self._async_fail_safe(group, restore, op, known_off)
             raise
 
         if power is None:
             # Status page down: the echoes are all there is. The zones the wake
             # switched off were each acknowledged, so show them off.
             power = dict(self.data.group_power) if self.data is not None else {}
-            for other in switched_off:
+            for other in known_off:
                 power[other] = False
+        if restore:
+            self._mute_owed.discard(group)
         # Switching on also applies the zone's turn-on volume, a fixed level or
         # LAST depending on how the zone is set up. Read it back rather than
         # assume either. The mute is what was sent and then verified.
@@ -469,52 +549,88 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
             muted=restore,
         )
 
-    async def _async_verify_mute(self, group: int) -> None:
+    async def _async_fail_safe(
+        self, group: int, restore: bool, op: _PowerOp, known_off: set[int]
+    ) -> None:
+        """After a switch-on broke part-way: leave the zone silent, say so honestly."""
+        zone_on: bool | None = None
+        muted: bool | object | None = _UNCHANGED
+        if restore:
+            zone_on, muted = await self._async_force_silent(group)
+        power = await self._async_read_group_power(op)
+        if power is None:
+            power = dict(self.data.group_power) if self.data is not None else {}
+            for other in known_off:
+                power[other] = False
+            power.pop(group, None)
+            if zone_on is not None:
+                power[group] = zone_on
+        self._publish_power(
+            set(), amp_on=True, group_power=power, group=group, muted=muted
+        )
+
+    async def _async_verify_mute(self, group: int, *, after_wake: bool) -> None:
         """Check a restored mute across the clear window, re-sending it if lost.
 
         The amplifier clears a zone's mute some time after switching it on,
         and whether a mute sent straight after the zone-on lands before or
         after that clear was never measured. So it is read back at intervals
-        covering the window, and every "off" is answered with another mute. The
-        first time that happens the log records when -- which is the missing
-        measurement.
+        covering the window -- a longer one straight after a wake, when the
+        zone may power up late -- and anything but a confirmed "muted" is
+        answered with another mute. It must end on a confirmed read, or this
+        raises and the caller makes the zone silent another way. The first time
+        a mute is found lost, the log records when: the missing measurement.
         """
+        delays = MUTE_VERIFY_DELAYS_AFTER_WAKE if after_wake else MUTE_VERIFY_DELAYS
+        # Up to two extra reads if the window ends without a confirmation.
+        schedule = (*delays, delays[-1], delays[-1])
+        letter = GROUP_LETTERS[group]
         elapsed = 0.0
-        resent = False
-        for delay in MUTE_VERIFY_DELAYS:
+        confirmed = False
+        for i, delay in enumerate(schedule):
+            if i >= len(delays) and confirmed:
+                return
             await asyncio.sleep(delay)
             elapsed += delay
-            if await self.client.get_mute(group) is False:
+            state = await self.client.get_mute(group)
+            if state is True:
+                confirmed = True
+                continue
+            if state is False:
                 _LOGGER.info(
                     "Zone %s lost its mute %.1f s after switching on; muting it again",
-                    GROUP_LETTERS[group],
+                    letter,
                     elapsed,
                 )
-                await self.client.set_mute(group, True)
-                resent = True
-            else:
-                resent = False
-        if resent:
-            await asyncio.sleep(MUTE_VERIFY_DELAYS[-1])
-            if await self.client.get_mute(group) is False:
-                await self.client.set_mute(group, True)
+            await self.client.set_mute(group, True)
+            confirmed = False
+        if not confirmed:
+            raise SonanceConnectionError(
+                f"Zone {letter}'s mute could not be confirmed after switching on"
+            )
 
-    async def _async_force_silent(self, group: int) -> bool | None:
+    async def _async_force_silent(self, group: int) -> tuple[bool | None, bool | None]:
         """Best effort to leave a zone silent after a failed switch-on.
 
-        Returns True if it is muted, False if it had to be switched off
-        instead, None if neither could be delivered.
+        Returns what is then known of the zone's power and mute. First a mute,
+        checked across the clear window like any restore. If that cannot be
+        confirmed, the zone is switched off -- and muted once more while off,
+        where no pending clear can undo it, so the next switch-on restores it.
+        Either way the mute is recorded as owed until it is known to be back.
         """
         letter = GROUP_LETTERS[group]
-        for _ in (1, 2):
-            try:
-                await self.client.set_mute(group, True)
-            except SonanceError:
-                continue
+        self._mute_owed.add(group)
+        try:
+            await self.client.set_mute(group, True)
+            await self._async_verify_mute(group, after_wake=False)
+        except SonanceError:
+            pass
+        else:
             _LOGGER.warning(
                 "Switching zone %s on failed part-way; it has been muted", letter
             )
-            return True
+            self._mute_owed.discard(group)
+            return None, True
         try:
             await self.client.set_group_power(group, False)
         except SonanceError:
@@ -523,34 +639,62 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                 "muted nor switched off; it may be playing unmuted",
                 letter,
             )
-            return None
+            return None, None
+        with contextlib.suppress(SonanceError):
+            await self.client.set_mute(group, True)
         _LOGGER.warning(
             "Switching zone %s on failed part-way and it could not be muted; it "
             "has been switched off",
             letter,
         )
-        return False
+        return False, None
 
     async def _async_read_volume(self, group: int) -> int | None:
-        """A zone's volume, asking twice: one late reply is routine."""
-        volume = await self.client.get_volume(group)
-        if volume is None:
-            volume = await self.client.get_volume(group)
-        return volume
+        """A zone's volume, asking twice: one late reply is routine.
+
+        Best effort: a switch-on that worked must still be published even if
+        its volume cannot be read. An unread volume is marked unverified rather
+        than left looking like the pre-switch-on level, which Assist would
+        otherwise step from.
+        """
+        volume: int | None = None
+        for _ in (1, 2):
+            try:
+                volume = await self.client.get_volume(group)
+            except SonanceError:
+                volume = None
+            if volume is not None:
+                self._volume_unverified.discard(group)
+                return volume
+        self._volume_unverified.add(group)
+        return None
+
+    def volume_verified(self, group: int) -> bool:
+        """False while the cached volume may predate the last switch-on."""
+        return group not in self._volume_unverified
+
+    def note_user_mute(self, group: int) -> None:
+        """The user set the mute themselves, so none is owed any more."""
+        self._mute_owed.discard(group)
 
     def _mute_to_restore(self, group: int, was_muted: bool | None) -> bool:
         """Whether to mute a zone after switching it on.
 
         Read from the amplifier while the zone is still off -- it keeps the
-        mute -- so it survives a Home Assistant restart. When that read fails,
-        the last polled value; when there is none, muted. A zone that comes up
+        mute -- so it survives a Home Assistant restart. A mute owed from a
+        switch-on that failed part-way wins over the read, because that
+        failure may have cleared it on the amplifier. When the read fails, the
+        last polled value; when there is none, muted. A zone that comes up
         silent is one tap to fix. One that comes up playing when it should not
         is the failure Home Assistant owning power exists to prevent.
         """
+        letter = GROUP_LETTERS[group]
+        if group in self._mute_owed:
+            _LOGGER.info("Restoring zone %s's mute from a failed switch-on", letter)
+            return True
         if was_muted is not None:
             return was_muted
         state = self.data.groups.get(group) if self.data is not None else None
-        letter = GROUP_LETTERS[group]
         if state is not None and state.muted is not None:
             _LOGGER.warning(
                 "Could not read zone %s's mute before switching it on; "
@@ -577,29 +721,49 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                 # not bring the zone back -- but best effort, since whether
                 # standby accepts it is unmeasured, and failing a request for
                 # silence on a silent zone would help nobody. What is shown is
-                # what the status page says, not what was hoped for.
+                # what the status page says: without it the flag is unknown,
+                # since an echo in standby is not proof it cleared.
                 await self._async_switch_off_in_standby(group)
                 power = await self._async_read_group_power(op)
-                flagged = bool(power.get(group)) if power is not None else False
-                if flagged:
+                if power is None:
+                    unknown = dict(self.data.group_power) if self.data else {}
+                    unknown.pop(group, None)
+                    self._publish_power(set(), amp_on=False, group_power=unknown)
+                    return
+                if power.get(group):
                     _LOGGER.info(
                         "Zone %s is still flagged on in standby; a wake from "
                         "outside Home Assistant would bring it back",
                         GROUP_LETTERS[group],
                     )
-                self._apply_power(group, zone_on=flagged, amp_on=False, power=power)
+                self._apply_power(
+                    group, zone_on=bool(power.get(group)), amp_on=False, power=power
+                )
                 return
 
+            error: SonanceError | None = None
             for attempt in (1, 2):
-                await self.client.set_group_power(group, False)
+                try:
+                    await self.client.set_group_power(group, False)
+                except SonanceError as err:
+                    # Maybe applied with its echo lost: the page will say.
+                    error = err
+                else:
+                    error = None
                 power, confirmed = await self._async_await_group_power(
                     group, on=False, op=op
                 )
-                if confirmed or power is None:
+                if confirmed:
+                    break
+                if power is None:
+                    if error is not None:
+                        raise error
                     break
                 if attempt == 1:
                     self._log_retry(group, on=False)
             else:
+                if error is not None:
+                    raise error
                 self._raise_not_confirmed(group, on=False)
 
             if power is None:
@@ -618,7 +782,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
 
     async def _async_wake_only(
         self, group: int, flags: dict[int, bool] | None, op: _PowerOp
-    ) -> list[int]:
+    ) -> set[int] | None:
         """Wake the amplifier so that only ``group`` comes back.
 
         Zone flags survive standby, and a wake brings back every zone whose
@@ -630,44 +794,46 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         its turn-on volume.
 
         They are switched off before the wake, so nothing plays at all if
-        standby accepts it, and again after it in case standby does not. The
-        status page shows the flags in standby, so the log says which it was.
-        Without the status page every zone is switched off, since there is no
-        telling which are flagged.
+        standby accepts it, and again after it whatever the standby page said,
+        in case standby echoed a zone-off it did not keep. Without the status
+        page every zone is switched off, since there is no telling which are
+        flagged. If standby does not answer a zone-off at all, the rest wait
+        for the wake: there is no sense waiting out a timeout for each.
 
-        Once the power-on has been sent this finishes even if the caller has
-        gone, and returns the zones switched off after the wake, each one
-        acknowledged.
+        Returns the zones known to be off -- acknowledged after the wake -- or
+        None if the caller went away before the power-on was sent. Once it has
+        been sent this finishes regardless.
         """
         targets = [g for g in self.groups if flags is None or flags.get(g) is not False]
         for zone in targets:
-            await self._async_switch_off_in_standby(zone)
+            if not await self._async_switch_off_in_standby(zone):
+                break
         after = await self._async_read_group_power(op)
-        lingering = targets if after is None else [g for g in targets if after.get(g)]
-        if lingering:
+        if after is not None and (still := [g for g in targets if after.get(g)]):
             _LOGGER.debug(
                 "Zones %s still flagged on in standby; switching them off "
                 "again once awake",
-                [GROUP_LETTERS[g] for g in lingering],
+                [GROUP_LETTERS[g] for g in still],
             )
         if op.abandoned:
-            return []
+            return None
         await self._async_wake()
 
-        switched_off: list[int] = []
+        switched_off: set[int] = set()
+        pending = list(targets)
         error: SonanceError | None = None
         for _ in (1, 2):
             failed: list[int] = []
-            for zone in lingering:
+            for zone in pending:
                 try:
                     await self.client.set_group_power(zone, False)
                 except SonanceError as err:
                     failed.append(zone)
                     error = err
                 else:
-                    switched_off.append(zone)
-            lingering = failed
-            if not lingering:
+                    switched_off.add(zone)
+            pending = failed
+            if not pending:
                 return switched_off
 
         # A zone the wake revived may be playing and could not be switched
@@ -676,20 +842,21 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         now = await self._async_read_group_power(op)
         if now is None:
             now = dict(self.data.group_power) if self.data is not None else {}
-            for zone in lingering:
+            for zone in pending:
                 now.pop(zone, None)
             for zone in switched_off:
                 now[zone] = False
-        self._publish_power([], amp_on=True, group_power=now)
+        self._publish_power(set(), amp_on=True, group_power=now)
         assert error is not None
         raise error
 
-    async def _async_switch_off_in_standby(self, group: int) -> None:
+    async def _async_switch_off_in_standby(self, group: int) -> bool:
         """Clear a zone's flag while the amp sleeps, if standby allows it.
 
         Whether standby echoes or even accepts a zone command is unmeasured,
         so a failure here is logged and passed over: what follows either does
-        not need it or does it again once the amplifier is awake.
+        not need it or does it again once the amplifier is awake. Returns
+        whether it was acknowledged.
         """
         try:
             await self.client.set_group_power(group, False)
@@ -699,6 +866,8 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                 GROUP_LETTERS[group],
                 err,
             )
+            return False
+        return True
 
     def _check_wake_holdoff(self) -> None:
         """Refuse a wake straight after one that failed, before sending anything."""
@@ -719,7 +888,13 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         window were lost although they echoed success.
         """
         _LOGGER.debug("Waking amplifier from standby")
-        await self.client.set_amp_power(True)
+        try:
+            await self.client.set_amp_power(True)
+        except SonanceError as err:
+            # Maybe applied with its echo lost. Power-on is only ever sent
+            # straight after a read of standby, so waiting to see is safe --
+            # and giving up here would skip the zone-offs after the wake.
+            _LOGGER.debug("Power-on not acknowledged (%s); waiting to see", err)
         deadline = self._now() + WAKE_TIMEOUT
         while self._now() < deadline:
             await asyncio.sleep(WAKE_POLL_INTERVAL)
@@ -854,14 +1029,18 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
 
     def _publish_power(
         self,
-        switched_off: list[int],
+        known_off: set[int],
         *,
         amp_on: bool,
         group_power: dict[int, bool] | None = None,
         group: int | None = None,
-        muted: bool | None = None,
+        muted: bool | object | None = _UNCHANGED,
     ) -> None:
-        """Push power state that is not one zone switching cleanly on or off."""
+        """Push power state that is not one zone switching cleanly on or off.
+
+        ``muted`` is written as given for ``group`` -- None included, meaning
+        unknown -- unless it is left as ``_UNCHANGED``.
+        """
         if self.data is None:
             return
         power = (
@@ -869,10 +1048,10 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
             if group_power is not None
             else dict(self.data.group_power)
         )
-        for zone in switched_off:
+        for zone in known_off:
             power[zone] = False
         groups = dict(self.data.groups)
-        if group is not None and muted is not None and group in groups:
+        if group is not None and muted is not _UNCHANGED and group in groups:
             groups[group] = replace(groups[group], muted=muted)
         self._generation += 1
         self.async_set_updated_data(

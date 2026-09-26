@@ -89,6 +89,15 @@ class SonanceConnectionError(SonanceError):
     """The connection failed, was lost, or the reply stream lost alignment."""
 
 
+class SonanceNotSentError(SonanceConnectionError):
+    """The command never reached the amplifier: there was no connection to send it on.
+
+    Distinct because it is the one failure that proves the command had no
+    effect. Every other failure after a write -- a lost or late echo -- leaves
+    open that the amplifier applied it.
+    """
+
+
 class ForbiddenOpcodeError(SonanceError):
     """A destructive opcode was requested.
 
@@ -169,7 +178,7 @@ class SonanceProtocol:
                 reader, writer = await asyncio.open_connection(self._host, self._port)
         except (TimeoutError, OSError) as err:
             self._reader = self._writer = None
-            raise SonanceConnectionError(
+            raise SonanceNotSentError(
                 f"Could not connect to {self._host}:{self._port}: {err}"
             ) from err
 
@@ -186,7 +195,7 @@ class SonanceProtocol:
         # until Home Assistant restarts.
         if self._closed:
             writer.close()
-            raise SonanceConnectionError(
+            raise SonanceNotSentError(
                 "Connection was closed while connecting; discarding the new socket"
             )
 
@@ -297,7 +306,7 @@ class SonanceProtocol:
     ) -> str | None:
         """Send one frame and read its reply. Caller must hold the lock."""
         if self._closed:
-            raise SonanceConnectionError("Connection has been closed")
+            raise SonanceNotSentError("Connection has been closed")
         if not self._connected:
             await self._connect_locked()
         assert self._reader is not None and self._writer is not None
@@ -502,10 +511,13 @@ class SonanceProtocol:
         if reply is None:
             return None
         match = RE_AMP_POWER.search(reply)
-        if not match:
+        word = match.group(1).lower() if match else None
+        if word not in ("on", "off"):
+            # Only "On" and "Off" have been seen. Anything else is unknown, not
+            # standby: reading it as standby would show playing zones OFF.
             self._unparsed("amplifier power", None, reply)
             return None
-        return match.group(1).lower() == "on"
+        return word == "on"
 
     async def set_amp_power(self, on: bool) -> None:
         reply = await self._request(OP_AMP_POWER_ON if on else OP_AMP_POWER_OFF, None)
@@ -535,6 +547,10 @@ class SonanceProtocol:
             try:
                 reply = await self._exchange_locked(on_frame, OP_GROUP_ON)
                 self._check_echo(RE_GROUP_POWER_ECHO, reply, "ON", group)
+            except SonanceNotSentError:
+                # Nothing reached the amplifier, so there is no zone-on to
+                # follow -- and the mute would only wait out another connect.
+                raise
             except SonanceError as err:
                 error = err
             reply = await self._exchange_locked(mute_frame, OP_MUTE_ON)

@@ -50,7 +50,11 @@ from custom_components.sonance_dsp.http_api import (
     Topology,
 )
 from custom_components.sonance_dsp.media_player import SonanceZone
-from custom_components.sonance_dsp.protocol import GroupState, SonanceConnectionError
+from custom_components.sonance_dsp.protocol import (
+    GroupState,
+    SonanceConnectionError,
+    SonanceNotSentError,
+)
 
 IDENTITY = AmplifierIdentity(
     serial="SERIAL123", name="Back Yard", model="DSP8-130 MKII", firmware="V2.2.8130"
@@ -99,6 +103,9 @@ class FakeAmp:
         self._lose: list[str] = []
         self._lose_echo: list[str] = []
         self._fail: list[str] = []
+        self._not_sent: list[str] = []
+        self.revive_on_wake: set[int] = set()
+        self.read_group_failures = 0
         self._pending_clear: dict[int, int] = {}
 
     # --- test controls -------------------------------------------------------
@@ -110,6 +117,10 @@ class FakeAmp:
     def lose_echo_next(self, entry: str) -> None:
         """Apply the next ``entry`` but never answer it: the late-echo case."""
         self._lose_echo.append(entry)
+
+    def not_sent_next(self, entry: str) -> None:
+        """Fail the next ``entry`` before it reaches the amp: no connection."""
+        self._not_sent.append(entry)
 
     def fail_next(self, entry: str, times: int = 1) -> None:
         """Refuse ``entry`` with no reply and no effect, while the amp is awake."""
@@ -140,6 +151,10 @@ class FakeAmp:
 
     def _ignored(self, entry: str) -> bool:
         """Is this write lost: mid-boot, refused in standby, or told to be?"""
+        if entry in self._not_sent:
+            self._not_sent.remove(entry)
+            self.log.pop()  # it never reached the amp
+            raise SonanceNotSentError(f"could not connect to send {entry}")
         if entry in self._fail and self.master and not self._booting:
             self._fail.remove(entry)
             self.dropped.append(entry)
@@ -168,15 +183,19 @@ class FakeAmp:
             self._booting -= 1
             if not self._booting:
                 self.master = True
+                for group in self.revive_on_wake:
+                    self.group_power[group] = True
             return False
         return self.master
 
     async def set_amp_power(self, on: bool) -> None:
-        self._tick(f"amp:{'on' if on else 'off'}")
+        entry = f"amp:{'on' if on else 'off'}"
+        self._tick(entry)
         if on and not self.master:
             self._booting = self.boot_polls
         elif not on:
             self.master = False
+        self._no_echo(entry)
 
     async def set_group_power(self, group: int, on: bool) -> None:
         entry = f"group{group}:{'on' if on else 'off'}"
@@ -206,6 +225,8 @@ class FakeAmp:
         error: SonanceConnectionError | None = None
         try:
             await self.set_group_power(group, True)
+        except SonanceNotSentError:
+            raise
         except SonanceConnectionError as err:
             error = err
         await self.set_mute(group, True)
@@ -243,6 +264,9 @@ class FakeAmp:
 
     async def read_group(self, group: int) -> GroupState:
         self._tick(f"q:group{group}")
+        if self.read_group_failures:
+            self.read_group_failures -= 1
+            raise SonanceConnectionError("no reply")
         return GroupState(
             group=group,
             volume_db=self.volume[group],
@@ -269,6 +293,7 @@ def fast_timing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(coord_mod, "POWER_CONFIRM_TIMEOUT", 0.05)
     monkeypatch.setattr(coord_mod, "WAKE_RETRY_HOLDOFF", 60.0)
     monkeypatch.setattr(coord_mod, "MUTE_VERIFY_DELAYS", (0, 0, 0, 0))
+    monkeypatch.setattr(coord_mod, "MUTE_VERIFY_DELAYS_AFTER_WAKE", (0,) * 6)
     monkeypatch.setattr(coord_mod, "AMP_POWER_READ_INTERVAL", 0)
 
 
@@ -641,6 +666,33 @@ async def test_turn_on_cancelled_before_anything_is_sent_does_nothing(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+    await wait_for_unlock(c)
+
+    assert amp.log == []
+
+
+async def test_turn_on_cancelled_during_the_amp_read_sends_nothing(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp(master=False)
+    amp.group_power = {0: False, 1: False, 2: True, 3: False}
+    c = make(hass, amp)
+    real = amp.get_amp_power
+    reading = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow() -> bool | None:
+        reading.set()
+        await release.wait()
+        return await real()
+
+    c.client.get_amp_power = slow
+    task = asyncio.ensure_future(c.async_turn_on(0))
+    await reading.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
     await wait_for_unlock(c)
 
     assert [e for e in amp.log if not e.startswith("q:")] == []
@@ -1242,8 +1294,14 @@ async def test_restore_survives_a_clear_that_lands_on_top_of_it(
     assert amp.log.count("mute0:on") >= 2
     assert c.data.groups[0].muted is True
     # Re-sent at the read that found it lost, so the later reads confirm it
-    # and no extra check is needed at the end.
-    assert amp.log.count("q:mute0") == 1 + len(coord_mod.MUTE_VERIFY_DELAYS)
+    # and no extra check is needed at the end. The window is longer after a
+    # wake.
+    window = (
+        coord_mod.MUTE_VERIFY_DELAYS
+        if master
+        else coord_mod.MUTE_VERIFY_DELAYS_AFTER_WAKE
+    )
+    assert amp.log.count("q:mute0") == 1 + len(window)
 
 
 async def test_an_unmuted_zone_is_not_verified(hass: HomeAssistant) -> None:
@@ -1256,11 +1314,15 @@ async def test_an_unmuted_zone_is_not_verified(hass: HomeAssistant) -> None:
     assert amp.log.count("q:mute0") == 1
 
 
+@pytest.mark.parametrize("overrides", [False, True], ids=["clear_cancelled", "late"])
 async def test_a_zone_on_applied_but_never_echoed_still_ends_muted(
-    hass: HomeAssistant,
+    hass: HomeAssistant, overrides: bool
 ) -> None:
-    """A late echo does not mean the zone-on was not applied."""
-    amp = FakeAmp()
+    """A late echo does not mean the zone-on was not applied.
+
+    With a clear that lands late, the fail-safe's own mute must be verified too.
+    """
+    amp = FakeAmp(clear_overrides_mute=overrides)
     amp.group_power[0] = False
     amp.mute[0] = True
     amp.lose_echo_next("group0:on")
@@ -1272,8 +1334,8 @@ async def test_a_zone_on_applied_but_never_echoed_still_ends_muted(
 
     assert amp.group_power[0] is True
     assert amp.mute[0] is True
-    # Unknown, not OFF: it may well be on.
-    assert 0 not in c.data.group_power
+    # Shown as the status page has it -- on -- not left showing OFF.
+    assert c.data.group_power[0] is True
     assert c.data.groups[0].muted is True
 
 
@@ -1593,7 +1655,9 @@ async def test_a_zone_that_can_be_neither_muted_nor_switched_off_is_reported(
         await c.async_turn_on(0)
 
     assert "may be playing unmuted" in caplog.text
-    assert 0 not in c.data.group_power
+    # On, per the status page, and its mute unknown -- not shown as muted.
+    assert c.data.group_power[0] is True
+    assert c.data.groups[0].muted is None
 
 
 async def test_a_revived_zone_that_will_not_switch_off_without_http_is_unknown(
@@ -1652,3 +1716,341 @@ async def test_a_poll_across_a_failed_wake_does_not_republish_standby(
 
     assert amp.live(2) is True
     assert zone(c, hass, 2).state is MediaPlayerState.ON
+
+
+
+# ---------------------------------------------------------------------------
+# Round three
+# ---------------------------------------------------------------------------
+
+
+async def test_a_failed_volume_read_back_still_publishes_the_zone_on(
+    hass: HomeAssistant,
+) -> None:
+    """The switch-on worked; a read-back that raises must not hide that."""
+    amp = FakeAmp()
+    amp.group_power[0] = False
+    c = make(hass, amp)
+    c.data.group_power[0] = False
+
+    async def broken(group: int) -> int:
+        raise SonanceConnectionError("no reply")
+
+    c.client.get_volume = broken
+    await c.async_turn_on(0)
+
+    assert zone(c, hass).state is MediaPlayerState.ON
+
+
+async def test_an_unread_volume_is_not_offered_as_a_level_until_read(
+    hass: HomeAssistant,
+) -> None:
+    """Assist's percentage step would jump from the pre-switch-on level."""
+    amp = FakeAmp()
+    amp.group_power[0] = False
+    c = make(hass, amp)
+    c.data.group_power[0] = False
+    c.data.groups[0] = replace(c.data.groups[0], volume_db=-3)
+    amp.unanswered_volume = 2
+    z = zone(c, hass)
+
+    await c.async_turn_on(0)
+    assert z.state is MediaPlayerState.ON
+    assert z.volume_level is None
+
+    c.data = await c._async_update_data()
+    assert z.volume_level == pytest.approx((FakeAmp.TURN_ON_VOLUME + 70) / 70)
+
+
+async def test_turn_off_in_standby_without_the_page_leaves_the_flag_unknown(
+    hass: HomeAssistant,
+) -> None:
+    """An echo in standby is not proof the flag cleared."""
+    amp = FakeAmp(master=False, standby_accepts_writes=False)
+    c = make(hass, amp)
+    amp.http_up = False
+
+    await c.async_turn_off(0)
+
+    assert 0 not in c.data.group_power
+    assert c.data.amp_power is False
+
+
+async def test_turn_on_refuses_a_zone_whose_power_is_unknown_on_an_awake_amp(
+    hass: HomeAssistant,
+) -> None:
+    """It may be playing, and a zone-on may reset its volume."""
+    amp = FakeAmp()
+    c = make(hass, amp)
+    c.data.group_power = {}
+    amp.http_up = False
+
+    with pytest.raises(HomeAssistantError) as err:
+        await c.async_turn_on(0)
+
+    assert err.value.translation_key == "zone_power_unknown"
+    assert [e for e in amp.log if not e.startswith("q:")] == []
+
+
+async def test_a_mute_owed_from_a_failed_switch_on_is_restored_next_time(
+    hass: HomeAssistant,
+) -> None:
+    """The failed switch-on cleared the mute on the amp; it must come back muted."""
+    amp = FakeAmp()
+    amp.group_power[0] = False
+    amp.mute[0] = True
+    amp.fail_next("mute0:on", times=20)
+    c = make(hass, amp)
+    with pytest.raises(SonanceConnectionError):
+        await c.async_turn_on(0)
+    amp.settle()
+    assert amp.live(0) is False
+    amp._fail.clear()
+    amp.mute[0] = False  # the amp lost it
+
+    await c.async_turn_on(0)
+    amp.settle()
+
+    assert amp.mute[0] is True
+
+
+async def test_a_user_mute_cancels_an_owed_mute(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    amp.group_power[0] = False
+    c = make(hass, amp)
+    c._mute_owed.add(0)
+    z = zone(c, hass)
+
+    await z.async_mute_volume(False)
+    await c.async_turn_on(0)
+    amp.settle()
+
+    assert amp.mute[0] is False
+
+
+async def test_an_unanswered_verify_read_is_not_a_confirmation(
+    hass: HomeAssistant,
+) -> None:
+    """Silence is not "muted": the mute is re-sent until a read confirms it."""
+    amp = FakeAmp(clear_overrides_mute=True)
+    amp.group_power[0] = False
+    amp.mute[0] = True
+    c = make(hass, amp)
+    real = amp.get_mute
+    reads = {"n": 0}
+
+    async def get_mute(group: int) -> bool | None:
+        value = await real(group)
+        reads["n"] += 1
+        # The pre-read answers; every verify read after the clear lands does not.
+        return value if reads["n"] < 3 else None
+
+    c.client.get_mute = get_mute
+
+    with pytest.raises(SonanceConnectionError):
+        await c.async_turn_on(0)
+    amp.settle()
+
+    # Never confirmed, so it went the fail-safe way -- and stayed silent.
+    assert amp.mute[0] is True or amp.live(0) is False
+
+
+async def test_turn_off_retries_a_zone_off_that_got_no_answer(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp()
+    amp.fail_next("group0:off")
+    c = make(hass, amp)
+
+    await c.async_turn_off(0)
+
+    assert amp.group_power[0] is False
+    assert amp.log.count("group0:off") == 2
+
+
+async def test_turn_off_trusts_the_page_when_the_echo_was_lost(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp()
+    amp.lose_echo_next("group0:off")
+    c = make(hass, amp)
+
+    await c.async_turn_off(0)
+
+    assert amp.log.count("group0:off") == 1
+    assert c.data.group_power[0] is False
+
+
+async def test_cancelled_during_the_pre_clear_does_not_wake(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp(master=False)
+    amp.group_power = {0: True, 1: False, 2: False, 3: False}
+    c = make(hass, amp)
+    real = amp.set_group_power
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow(group: int, on: bool) -> None:
+        started.set()
+        await release.wait()
+        await real(group, on)
+
+    c.client.set_group_power = slow
+    task = asyncio.ensure_future(c.async_turn_on(1))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    await wait_for_unlock(c)
+
+    assert "amp:on" not in amp.log
+    assert c.data.amp_power is False
+
+
+async def test_a_power_on_whose_echo_is_lost_still_cleans_up_after_the_wake(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp(master=False, standby_accepts_writes=False)
+    amp.group_power = {0: True, 1: False, 2: True, 3: True}
+    amp.lose_echo_next("amp:on")
+    c = make(hass, amp)
+
+    await c.async_turn_on(1)
+
+    assert [g for g in range(4) if amp.live(g)] == [1]
+
+
+async def test_zones_are_switched_off_after_the_wake_even_if_standby_said_cleared(
+    hass: HomeAssistant,
+) -> None:
+    """Nothing seen in standby -- echo or page -- proves the wake will not revive it."""
+    amp = FakeAmp(master=False)
+    amp.group_power = {0: True, 1: False, 2: True, 3: False}
+    amp.revive_on_wake = {0, 2}
+    c = make(hass, amp)
+
+    await c.async_turn_on(1)
+
+    assert [g for g in range(4) if amp.live(g)] == [1]
+
+
+async def test_the_pre_clear_stops_at_the_first_unanswered_zone(
+    hass: HomeAssistant,
+) -> None:
+    """Standby evidently not answering: do not wait out a timeout per zone."""
+    amp = FakeAmp(master=False, standby_echoes_writes=False)
+    amp.group_power = {0: True, 1: False, 2: True, 3: True}
+    c = make(hass, amp)
+
+    await c.async_turn_on(1)
+
+    wake = amp.log.index("amp:on")
+    assert [e for e in amp.log[:wake] if e.endswith(":off")] == ["group0:off"]
+    assert [g for g in range(4) if amp.live(g)] == [1]
+
+
+async def test_a_zone_on_that_never_left_changes_nothing(hass: HomeAssistant) -> None:
+    """No connection, so no zone-on -- and no fail-safe for a zone that is off."""
+    amp = FakeAmp()
+    amp.group_power[0] = False
+    amp.mute[0] = True
+    amp.not_sent_next("group0:on")
+    c = make(hass, amp)
+    c.data.group_power[0] = False
+
+    with pytest.raises(SonanceNotSentError):
+        await c.async_turn_on(0)
+
+    assert "mute0:on" not in amp.log
+    assert c.data.group_power[0] is False
+
+
+async def test_a_poll_retries_once_before_calling_the_amp_unreachable(
+    hass: HomeAssistant,
+) -> None:
+    """An unavailable entity ignores turn_off, so one blip must not cause it."""
+    amp = FakeAmp()
+    c = make(hass, amp)
+    amp.read_group_failures = 1
+
+    data = await c._async_update_data()
+
+    assert data.groups[0].volume_db == amp.volume[0]
+
+
+async def test_a_poll_that_fails_twice_asks_to_be_retried_soon(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp()
+    c = make(hass, amp)
+    amp.read_group_failures = 2
+
+    with pytest.raises(UpdateFailed) as err:
+        await c._async_update_data()
+
+    assert err.value.retry_after == coord_mod.POLL_RETRY_AFTER
+
+
+async def test_a_step_up_without_a_reading_respects_the_ceiling(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp()
+    c = make(hass, amp)
+    c.data.groups[0] = replace(c.data.groups[0], volume_db=0)
+    c.client.volume_up = MagicMock(side_effect=lambda g: asyncio.sleep(0))
+    amp.unanswered_volume = 1
+    z = zone(c, hass)  # ceiling 0 dB
+
+    await z.async_volume_up()
+
+    c.client.volume_up.assert_not_called()
+
+
+async def test_a_failure_after_the_caller_went_away_is_logged(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    amp = FakeAmp()
+    amp.group_power[0] = False
+    c = make(hass, amp)
+    real = amp.set_group_power
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_then_fail(group: int, on: bool) -> None:
+        await real(group, on)
+        started.set()
+        await release.wait()
+        raise SonanceConnectionError("no reply")
+
+    c.client.set_group_power = slow_then_fail
+    task = asyncio.ensure_future(c.async_turn_on(0))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    await wait_for_unlock(c)
+    await asyncio.sleep(0)
+
+    assert "after the request was cancelled" in caplog.text
+
+
+async def test_a_failed_switch_on_without_the_page_shows_the_zone_unknown(
+    hass: HomeAssistant,
+) -> None:
+    """It may well be on: not OFF."""
+    amp = FakeAmp()
+    amp.group_power[0] = False
+    amp.mute[0] = True
+    amp.lose_echo_next("group0:on")
+    c = make(hass, amp)
+    c.data.group_power[0] = False
+    amp.http_up = False
+
+    with pytest.raises(SonanceConnectionError):
+        await c.async_turn_on(0)
+
+    assert 0 not in c.data.group_power
+    assert c.data.groups[0].muted is True

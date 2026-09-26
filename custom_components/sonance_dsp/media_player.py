@@ -193,14 +193,20 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
 
     @property
     def volume_level(self) -> float | None:
-        # None while the zone is off. HA hides it from an off entity's state
-        # anyway, but Assist's percentage step reads this property directly --
-        # "turn it up 10 percent" said while the zone is still waking would
-        # otherwise add 10% to the volume from BEFORE the turn-on and land it
-        # after, jumping the zone by however far the turn-on volume is from it.
-        # With None the step fails instead.
+        # None while the zone is off, or while its cached level may predate its
+        # last switch-on. HA hides it from an off entity's state anyway, but
+        # Assist's percentage step reads this property directly -- "turn it up
+        # 10 percent" said while the zone is still waking would otherwise add
+        # 10% to the volume from BEFORE the switch-on and land it after,
+        # jumping the zone by however far the turn-on volume is from it. With
+        # None, HA's handler fails with an error instead.
         state = self._state
-        if state is None or state.volume_db is None or self._powered() is False:
+        if (
+            state is None
+            or state.volume_db is None
+            or self._powered() is False
+            or not self.coordinator.volume_verified(self._group)
+        ):
             return None
         return self._to_level(state.volume_db)
 
@@ -438,10 +444,19 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
             client = self.coordinator.client
             current = await client.get_volume(self._group)
             if current is None:
-                if delta > 0:
-                    await client.volume_up(self._group)
-                else:
+                if delta < 0:
                     await client.volume_down(self._group)
+                    return
+                # Up against an unread level: the device's own step, unless the
+                # last known level is already at the ceiling it would cross.
+                state = self._state
+                if (
+                    state is not None
+                    and state.volume_db is not None
+                    and state.volume_db >= self._effective_max_db
+                ):
+                    return
+                await client.volume_up(self._group)
                 return
             target = max(MIN_VOLUME_DB, min(self._effective_max_db, current + delta))
             if target != current:
@@ -452,4 +467,5 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
     async def async_mute_volume(self, mute: bool) -> None:
         async with self.coordinator.command_lock:
             await self.coordinator.client.set_mute(self._group, mute)
+            self.coordinator.note_user_mute(self._group)
             self.coordinator.apply_optimistic(self._group, muted=mute)

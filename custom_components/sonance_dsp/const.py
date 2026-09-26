@@ -191,9 +191,16 @@ AMP_POWER_READ_INTERVAL: Final = 0.5
 # seemed to show it waited 0.5 s per command -- so the restore is verified
 # rather than trusted.
 MUTE_VERIFY_DELAYS: Final = (0.3, 0.3, 0.4, 0.5)
+# Straight after a wake the window runs to 5 s. Mute writes sent during a boot
+# were lost while zone-on writes were kept, which fits the clear landing when a
+# zone actually powers up -- and just after "On", that may be later.
+MUTE_VERIFY_DELAYS_AFTER_WAKE: Final = (*MUTE_VERIFY_DELAYS, 1.5, 2.0)
 # How long unload waits for a power change in progress before disconnecting.
 # Cutting one off mid-wake leaves the zones a wake revived playing.
-CLOSE_WAIT: Final = WAKE_TIMEOUT + 10
+CLOSE_WAIT: Final = WAKE_TIMEOUT + 15
+# After a poll fails outright, the next one comes this soon rather than a
+# whole interval later: an unavailable entity ignores turn_off.
+POLL_RETRY_AFTER: Final = 5.0
 # A wake that timed out is not retried for this long. Without it a scene
 # switching four zones on against an amplifier that will not wake spends
 # four full timeouts -- over a minute and a half -- with every zone command
