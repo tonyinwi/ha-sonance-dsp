@@ -75,7 +75,10 @@ async def coordinator(hass: HomeAssistant) -> SonanceCoordinator:
             )
             for g in (0, 1, 2, 3)
         },
-        group_power={},
+        # A powered amplifier with every zone on. Zone state needs BOTH: a
+        # zone's flag survives standby, so neither alone means it is on.
+        group_power={0: True, 1: True, 2: True, 3: True},
+        amp_power=True,
     )
     return c
 
@@ -109,11 +112,14 @@ def test_zone_is_a_receiver_with_the_features_it_implements(
         MediaPlayerEntityFeature.VOLUME_STEP,
         MediaPlayerEntityFeature.VOLUME_MUTE,
         MediaPlayerEntityFeature.SELECT_SOURCE,
+        MediaPlayerEntityFeature.TURN_ON,
+        MediaPlayerEntityFeature.TURN_OFF,
     ):
         assert flag in f
+    assert MediaPlayerEntityFeature.TURN_ON in f
+    assert MediaPlayerEntityFeature.TURN_OFF in f
     # Not declared, because not implemented -- a declared-but-missing feature
     # is a broken control on someone's dashboard.
-    assert MediaPlayerEntityFeature.TURN_ON not in f
     assert MediaPlayerEntityFeature.PLAY not in f
 
 

@@ -177,7 +177,7 @@ SOURCE 1-4             FF 55 02 <08+S> <N>          all groups  FF 55 01 <08+S>
 GET SOURCE             FF 55 02 11 <N>    -- see the two traps below
 
 GROUP POWER on/off/tog FF 55 02 65|66|67 <N>        all groups  FF 55 01 65|66|67
-GROUP POWER QUERY      -- does not exist; use HTTP page=status
+GROUP POWER QUERY      -- does not exist; use HTTP page=status (see Power)
 
 AMP POWER on/off/tog   FF 55 01 01|02|03
 AMP POWER QUERY        FF 55 01 70        -> "Power status :On"
@@ -191,7 +191,7 @@ GET OVERTEMP           FF 55 02 18 <C>
 
 Captured on group D (no speakers connected) on 2026-09-20.
 
-### `Src1=` is a fixed label, not the selected source
+### `Src1=` names the Source 1 slot, not a source number
 
 ```
 select source 2  ->  query answers  'Cmd:Source1     ,Group:D Src1=Input 2L'
@@ -202,9 +202,29 @@ select source 4  ->  query answers  'Cmd:Source1     ,Group:D Src1=Input 4L'
 **Both `Cmd:Source1` and `Src1=` stay `1` whatever is selected.** Only the name changes. A
 parser that reads the digit as the source number gets `1` forever.
 
+The reason is in the manual's terminology rather than a firmware quirk. Each output
+channel has two source *slots*, **Source 1** (the routed source) and **Source 2** (an
+override for paging or a doorbell, see below). The query reports which input is assigned
+to **slot 1**, so the `1` is the slot, and it was never meant to be a source number. An
+earlier version of this document called it a "fixed label"; the behaviour described was
+right, the explanation was not.
+
 Resolve the source from the **name** instead, through `input-names` from the HTTP endpoint.
 Inputs are stereo pairs, so indices 0/1 are source 1, 2/3 are source 2, and so on; a group
 query reports its LEFT member, so the name is normally the even index of the pair.
+
+### Source 2 and Mode Source 2: a hardware override layer
+
+Not used by this integration, recorded because it is easy to mistake for routing. Per
+channel, **Source 2** is a second input and **Mode Source 2** decides what it does
+(MkIII manual, In/Out Settings):
+
+- `OFF` -- *"Source 2 has no effect on the operation of the channel."*
+- `MIX` -- *"Input levels will be attenuated by 6dB, and signals will be summed."*
+- `MUTE` -- *"Source 1 will be muted while Source 2 is active."* Audio-sensed ducking,
+  intended for a doorbell or paging input.
+
+Readable over HTTP as `sources-2` and `mode-sources`; no TCP opcode for either is known.
 
 ### A source *change* replies with 256 bytes, not 50
 
@@ -255,6 +275,86 @@ The vendor's power-on sequence is amp on → group on (200 ms) → query volume 
 rather than a bare group-on. Their power-off sends group-off **twice**, which suggests a
 single one proved unreliable.
 
+## Power: measured in Power Button mode
+
+Everything here was measured on 2026-09-26, silently, with the source idle. It
+assumes the amplifier's **Auto On method is Power Button with every channel's
+sleep set to OFF**, which is the vendor's own recommendation for IP control
+(*"When controlling the amplifier using IP and IR commands we suggest using the
+Power Button Auto On mode."*). In `Audio` mode the amplifier wakes zones on
+signal by itself, and in `Audio Green` it also drops the network while asleep.
+
+| Command | Reply | Notes |
+|---|---|---|
+| `FF 55 02 65 <N>` zone on | `Cmd:GroupON ,Group:X` | one command is enough |
+| `FF 55 02 66 <N>` zone off | `Cmd:GroupOFF ,Group:X` | the Savant profile sends this twice; not needed here |
+| `FF 55 01 01` amp on | `Cmd:PowerOn` | starts a ~10 s boot |
+| `FF 55 01 02` amp standby | `Cmd:PowerOff` | network stays up |
+| `FF 55 01 70` amp query | `Power status :On` / `:Off` | the only master-power read |
+
+What each command actually does:
+
+- **Switching a zone on clears its mute**, and applies the zone's turn-on
+  volume. The clear was already visible at the first sample, about 0.5 s after
+  the zone-on, and a mute sent about 0.5 s after the zone-on stuck.
+
+  ⚠️ *Corrected 2026-09-26.* This line used to say "re-muting immediately
+  afterwards sticks". The probe behind it waited out a 0.5 s receive timeout
+  after every command, so its "immediate" mute went out half a second later,
+  after the clear had landed. Whether a mute sent within one round trip of the
+  zone-on survives the clear is **unmeasured**. The integration reads the mute
+  back across the window and re-sends it.
+- **Standby and wake do not clear mute.** Zones muted before standby are still
+  muted after it.
+- **A switched-off zone still answers.** Volume, mute and source are all
+  readable with the zone off -- so "it answered" does not mean "it is on".
+- **A zone's on/off flag survives standby.** The HTTP status page reports a
+  zone `on` while the whole amplifier is in standby. A zone is only producing
+  output when the amplifier is on **and** the zone is on.
+- **Switching every zone off does not put the amplifier in standby.** Master
+  power stayed `On` with all four zones off.
+- **Standby keeps the network up.** TCP and HTTP both answered with master
+  power `Off`, so a controller can always wake it.
+- **A wake takes about 10 s** (10.6 s measured; the manual says 9-12), and
+  **mute writes sent before it finished were lost even though they echoed
+  success.** Zone-on writes sent in the same window *were* applied. Why the two
+  differed was not established -- one explanation that fits is that the mute
+  clear lands when a zone actually powers up, over any mute sent before it.
+  The integration's policy is the conservative one: nothing but status queries
+  until the amplifier reports `On`.
+  Status queries during the boot are fine.
+- **The HTTP status page reflects a zone power change in 0.01-0.06 s**, which
+  makes it a reliable read-back.
+
+These were **not** measured, and the integration is written to be right
+either way rather than to depend on them:
+
+- **How soon after a zone-on a mute survives.** See the correction above. The
+  mute is read back at 0.3, 0.6, 1.0 and 1.5 s and re-sent whenever it reads
+  off, and the log records when that happens -- so the first time it does, the
+  answer is in the log.
+- **Power-on sent to an amplifier that is already on**, and **standby sent to
+  one already in standby.** Power-on is only ever sent straight after a read of
+  `Off`; if the amplifier's power cannot be read, nothing is switched.
+- **A zone-on sent to a zone that is already on.** Only off-to-on was measured.
+  If it re-applies the turn-on volume and clears mute the way off-to-on does, a
+  scene re-asserting "on" would reset a playing zone. So it is never sent to a
+  zone the amplifier reports on.
+- **Zone commands while the amplifier is in standby.** Volume writes in standby
+  were measured to work (2026-09-20); zone on/off was not. Waking brings back
+  every zone whose flag survived standby, so before a wake the integration
+  switches the other flagged zones off, then again after it in case standby
+  ignored or did not answer the first attempt. Its debug log says which it was
+  -- the status page shows the flags in standby -- so this answers itself the
+  first time it happens.
+
+### Turn-on volume
+
+Per zone, in the In/Out tab: either a fixed level, or `LAST` to keep the volume
+across a power cycle. A zone power-on over IP applies it -- the manual only
+mentions the power switch and sleep. The web UI appears to store `LAST` as the
+out-of-range value `13`; that is inferred from its JavaScript and unverified.
+
 ## Push: tested, and it does not
 
 **The amplifier sends nothing unsolicited when state is changed out of band.** Tested
@@ -285,8 +385,12 @@ volume is, so state would still be polled.
 
 - Behaviour on a malformed frame or an out-of-range volume byte. No NAK format is documented
   anywhere.
-- Whether a group power change over TCP is reflected in the HTTP status page, and how fast.
 - Whether the amp drops a held-open idle socket, and so whether a keepalive is needed.
+- A zone-on sent to a zone that is already on, and zone on/off sent in standby. See
+  *Power* above: the integration avoids depending on either.
+
+(Whether a zone power change over TCP shows on the HTTP status page, and how fast, was on
+this list until 2026-09-26: it does, in 0.01-0.06 s.)
 
 ## Model coverage
 

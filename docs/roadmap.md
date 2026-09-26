@@ -74,14 +74,24 @@ until it is mapped to this integration.
   zero, which is precisely the control that does nothing.
 - Power mapping is optional. Amplifiers set to audio-sense auto-on wake themselves.
 
-## ~~3 — Source~~ — done; power still open
+## ~~3 — Source and power~~ — done
 
-`SELECT_SOURCE` with names read from the device. Group power written over TCP and read back
-over HTTP, since no group-power query exists.
+`SELECT_SOURCE` with names read from the device. Zone power written over TCP and confirmed
+over HTTP, since no group-power query exists, with Home Assistant owning power: see
+*Power* in [`design.md`](design.md#power) for the rules and what each one defends against.
 
-Use the vendor's power-on sequence — amp on → group on (200 ms) → query volume (1000 ms) —
-rather than a bare group-on. Their power-off sends group-off **twice**, which suggests one
-proved unreliable; worth replicating rather than tidying away.
+Follow-ups:
+
+- **Check the premise at setup.** Home Assistant owning power depends on the amplifier's
+  Auto On method being Power Button with channel sleep off, and nothing reads it. Find the
+  page and key that carry it (general-settings or in-out-settings — unverified), read it at
+  setup, and raise a repair issue when it is anything else.
+- **Turn-on volume above the configured ceiling.** A zone's turn-on volume can exceed the
+  ceiling set in the options flow (the factory default is +12 dB), and switching it on then
+  lands above the slider's 100%. Warn at setup, or pull the level down after the read-back.
+- **Measure what the code defends against without knowing:** how soon after a zone-on a
+  mute survives; a zone-on to a zone already on; zone on/off in standby; power-on to an amp
+  already on. Each needs the amplifier and a go-ahead, with the source idle.
 
 ## 4 — Diagnostics and configuration
 

@@ -701,3 +701,107 @@ async def test_set_source_rejects_out_of_range_before_the_socket(
         with pytest.raises(ValueError):
             await client.set_source(0, source)
         assert link.frames == []
+
+
+# ---------------------------------------------------------------------------
+# Power and mute writes: acknowledged by their own echo, not by any 50 bytes
+# ---------------------------------------------------------------------------
+
+# Recorded from the device on 2026-09-26.
+GROUP_ON_ECHO_A = "Cmd:GroupON      ,Group:A"
+GROUP_OFF_ECHO_D = "Cmd:GroupOFF      ,Group:D"
+MUTE_ON_ECHO_A = "Cmd:MuteOn      , Group:A"
+POWER_ON_ECHO = "Cmd:PowerOn"
+
+FRAME_GROUP_ON_A = b"\xff\x55\x02\x65\x00"
+FRAME_GROUP_OFF_D = b"\xff\x55\x02\x66\x03"
+FRAME_MUTE_ON_A = b"\xff\x55\x02\x07\x00"
+FRAME_POWER_ON = b"\xff\x55\x01\x01"
+
+
+@pytest.mark.parametrize(
+    ("call", "frame", "echo"),
+    [
+        (lambda c: c.set_group_power(0, True), FRAME_GROUP_ON_A, GROUP_ON_ECHO_A),
+        (lambda c: c.set_group_power(3, False), FRAME_GROUP_OFF_D, GROUP_OFF_ECHO_D),
+        (lambda c: c.set_mute(0, True), FRAME_MUTE_ON_A, MUTE_ON_ECHO_A),
+        (lambda c: c.set_amp_power(True), FRAME_POWER_ON, POWER_ON_ECHO),
+    ],
+    ids=["group_on", "group_off", "mute_on", "power_on"],
+)
+async def test_a_write_accepts_its_recorded_echo(call, frame: bytes, echo: str) -> None:
+    link, patcher = fake_link({frame: padded(echo)})
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        await call(client)
+    assert link.frames == [frame]
+    assert client.is_connected
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        NUL_REPLY,
+        padded("Cmd:GroupON      ,Group:C"),  # another group's
+        padded("Cmd:GroupOFF      ,Group:A"),  # the opposite command
+        padded(VOLUME_QUERY_REPLY),  # a late reply to something else
+    ],
+    ids=["nul_padding", "other_group", "opposite", "stray_reply"],
+)
+async def test_a_write_answered_by_anything_else_is_not_acknowledged(
+    reply: bytes,
+) -> None:
+    """With the status page down the echo is the only confirmation there is."""
+    _link, patcher = fake_link({FRAME_GROUP_ON_A: reply})
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher, pytest.raises(SonanceConnectionError):
+        await client.set_group_power(0, True)
+    # Out of step: the socket is reset, as for any desync.
+    assert not client.is_connected
+
+
+async def test_switch_on_muted_sends_both_frames_back_to_back() -> None:
+    link, patcher = fake_link(
+        {
+            FRAME_GROUP_ON_A: padded(GROUP_ON_ECHO_A),
+            FRAME_MUTE_ON_A: padded(MUTE_ON_ECHO_A),
+        }
+    )
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        await client.set_group_power_muted(0)
+    assert link.frames == [FRAME_GROUP_ON_A, FRAME_MUTE_ON_A]
+
+
+async def test_switch_on_muted_still_mutes_when_the_zone_on_is_not_acknowledged(
+) -> None:
+    """An unacknowledged zone-on may still have been applied, so mute anyway.
+
+    Answered here with padding rather than silence only to avoid waiting out
+    the reply timeout, which is a default argument and cannot be patched.
+    """
+    link, patcher = fake_link(
+        {FRAME_GROUP_ON_A: NUL_REPLY, FRAME_MUTE_ON_A: padded(MUTE_ON_ECHO_A)}
+    )
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher, pytest.raises(SonanceConnectionError):
+        await client.set_group_power_muted(0)
+    assert link.frames == [FRAME_GROUP_ON_A, FRAME_MUTE_ON_A]
+
+
+async def test_nothing_can_queue_between_the_zone_on_and_its_mute() -> None:
+    """A poll's query sent meanwhile must wait until both have been answered."""
+    link, patcher = fake_link(
+        {
+            FRAME_GROUP_ON_A: (0.02, padded(GROUP_ON_ECHO_A)),
+            FRAME_MUTE_ON_A: padded(MUTE_ON_ECHO_A),
+            FRAME_QUERY_VOLUME_D: padded(VOLUME_QUERY_REPLY),
+        }
+    )
+    client = SonanceProtocol("192.0.2.10", 52000)
+    with patcher:
+        switch = asyncio.ensure_future(client.set_group_power_muted(0))
+        await asyncio.sleep(0.005)
+        query = asyncio.ensure_future(client.get_volume(3))
+        await asyncio.gather(switch, query)
+    assert link.frames == [FRAME_GROUP_ON_A, FRAME_MUTE_ON_A, FRAME_QUERY_VOLUME_D]
