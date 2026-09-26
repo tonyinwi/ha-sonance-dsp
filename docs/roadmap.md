@@ -48,7 +48,19 @@ creating phantom entities, and handle a group that exists but has no speakers wi
 Add the amp-level entity on the global commands, with the drift attribute described in
 [`design.md`](design.md#the-amp-level-entity).
 
-## 2a — Music Assistant
+## ~~2a~~ — partly done: upstream mirroring shipped
+
+A zone now mirrors title, artist, album, artwork and transport state from a
+media player linked to the source it is currently playing, configured per
+source in the options flow. The link follows the **route**: change a zone's
+source and its metadata moves with it.
+
+Still open for Music Assistant proper — mapping the amp-level entity as MA's
+volume control — because the amp-level entity does not exist yet. See the note
+under it in [`design.md`](design.md#the-amp-level-entity): `gain-offset` varies
+per zone, so averaging zone volumes reports a figure matching no zone.
+
+## 2a (original) — Music Assistant
 
 Not an extra. Where the source device feeding the amplifier is set to **fixed output**, its
 own volume control does nothing, and MA's volume slider for that player controls nothing
@@ -62,7 +74,7 @@ until it is mapped to this integration.
   zero, which is precisely the control that does nothing.
 - Power mapping is optional. Amplifiers set to audio-sense auto-on wake themselves.
 
-## 3 — Source and power
+## ~~3 — Source~~ — done; power still open
 
 `SELECT_SOURCE` with names read from the device. Group power written over TCP and read back
 over HTTP, since no group-power query exists.

@@ -30,6 +30,7 @@ from custom_components.sonance_dsp.config_flow import (
     async_test_control_connection,
 )
 from custom_components.sonance_dsp.const import (
+    CONF_INPUT_LINKS,
     CONF_MAX_DB,
     CONF_SCAN_INTERVAL,
     DEFAULT_TCP_PORT,
@@ -332,7 +333,11 @@ async def test_options_flow_shows_and_saves(hass: HomeAssistant) -> None:
         await hass.async_block_till_done()
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert entry.options == {CONF_MAX_DB: -6, CONF_SCAN_INTERVAL: 15}
+    assert entry.options == {
+        CONF_MAX_DB: -6,
+        CONF_SCAN_INTERVAL: 15,
+        CONF_INPUT_LINKS: {},
+    }
 
 
 async def test_options_flow_coerces_selector_floats_to_int(
@@ -364,3 +369,95 @@ async def test_options_flow_is_reached_from_the_config_flow() -> None:
     assert isinstance(
         SonanceConfigFlow.async_get_options_flow(None), SonanceOptionsFlow
     )
+
+
+# ---------------------------------------------------------------------------
+# Upstream links
+#
+# One entity per source, stored keyed by source NUMBER. The form is flat --
+# input_link_1..input_link_4 -- because a schema cannot hold a dict field, so
+# the round trip through that flattening is what these cover.
+# ---------------------------------------------------------------------------
+
+
+async def test_options_flow_stores_links_keyed_by_source_number(
+    hass: HomeAssistant,
+) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN, unique_id=IDENTITY.serial, data=USER_INPUT, title="Back Yard"
+    )
+    entry.add_to_hass(hass)
+
+    with patch(SETUP_PATH, return_value=True):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {
+                CONF_MAX_DB: 0,
+                CONF_SCAN_INTERVAL: 10,
+                "input_link_1": "media_player.streamer",
+                "input_link_3": "media_player.turntable",
+            },
+        )
+        await hass.async_block_till_done()
+
+    assert entry.options[CONF_INPUT_LINKS] == {
+        "1": "media_player.streamer",
+        "3": "media_player.turntable",
+    }
+
+
+async def test_options_flow_drops_cleared_links(hass: HomeAssistant) -> None:
+    """Clearing a link must remove it, not leave the old entity behind."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=IDENTITY.serial,
+        data=USER_INPUT,
+        title="Back Yard",
+        options={
+            CONF_MAX_DB: 0,
+            CONF_SCAN_INTERVAL: 10,
+            CONF_INPUT_LINKS: {"1": "media_player.streamer"},
+        },
+    )
+    entry.add_to_hass(hass)
+
+    with patch(SETUP_PATH, return_value=True):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {CONF_MAX_DB: 0, CONF_SCAN_INTERVAL: 10}
+        )
+        await hass.async_block_till_done()
+
+    assert entry.options[CONF_INPUT_LINKS] == {}
+
+
+async def test_options_form_prefills_existing_links(hass: HomeAssistant) -> None:
+    """A stored dict has to flatten back into the per-source form fields.
+
+    Without this the dialog opens with every link blank, and saving would
+    silently clear links the user never touched.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=IDENTITY.serial,
+        data=USER_INPUT,
+        title="Back Yard",
+        options={
+            CONF_MAX_DB: -6,
+            CONF_SCAN_INTERVAL: 20,
+            CONF_INPUT_LINKS: {"2": "media_player.streamer"},
+        },
+    )
+    entry.add_to_hass(hass)
+
+    with patch(SETUP_PATH, return_value=True):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+
+    suggested = {
+        key.schema: key.description.get("suggested_value")
+        for key in result["data_schema"].schema
+        if key.description
+    }
+    assert suggested["input_link_2"] == "media_player.streamer"
+    assert suggested[CONF_MAX_DB] == -6

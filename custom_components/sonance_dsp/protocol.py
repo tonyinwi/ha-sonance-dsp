@@ -71,6 +71,10 @@ DISCOVERY_TIMEOUT = 1.5
 # Below that a slow reply can land after its own deadline, which is exactly the
 # case the group-letter check exists to catch.
 COMMAND_SPACING = 0.12
+# How long to wait for leftover padding before sending a new command. Only
+# ever spent when the previous reply was longer than one frame, because the
+# read below returns immediately once the buffer is empty.
+STALE_DRAIN_TIMEOUT = 0.05
 
 
 class SonanceError(Exception):
@@ -101,7 +105,8 @@ class GroupState:
     group: int
     volume_db: int | None = None
     muted: bool | None = None
-    source: int | None = None
+    # The NAME only. The protocol's source number cannot be trusted -- see
+    # get_source. Callers that need the number resolve it from the name.
     source_name: str | None = None
 
     @property
@@ -248,6 +253,7 @@ class SonanceProtocol:
         timeout: float = REPLY_TIMEOUT,
         require_reply: bool = True,
         tolerate_silence: bool = False,
+        drain_after: bool = False,
     ) -> str | None:
         """Send one frame and return its reply.
 
@@ -258,6 +264,11 @@ class SonanceProtocol:
 
         ``tolerate_silence`` is for group discovery, where no reply is the
         expected answer for an empty group and must not tear the socket down.
+
+        ``drain_after`` is for the opcodes whose reply is longer than one frame
+        -- see ``_discard_padding``. It is opt-in because the drain costs a
+        timeout every time it runs, so paying it on every command would add
+        roughly half a second to each poll cycle.
         """
         frame = self.build_frame(opcode, operand)
         async with self._lock:
@@ -271,6 +282,8 @@ class SonanceProtocol:
                 await self._writer.drain()
                 async with asyncio.timeout(timeout):
                     raw = await self._reader.readexactly(REPLY_LENGTH)
+                if drain_after:
+                    await self._discard_padding()
             except TimeoutError:
                 # NB TimeoutError is an OSError subclass, so this clause must
                 # stay above the OSError one.
@@ -299,6 +312,48 @@ class SonanceProtocol:
         # A group with no channels can answer with 50 NUL bytes rather than
         # with silence. Both mean absent.
         return text or None
+
+    async def _discard_padding(self) -> int:
+        """Drop the padding behind a reply that is longer than one frame.
+
+        Not every reply is 50 bytes. A source CHANGE answers with 256 -- the
+        payload in the first frame and 206 NUL bytes behind it, on opcodes
+        0x0A/0x0B/0x0C but not 0x09. Reading a fixed 50 leaves that padding
+        queued, so the next four commands read pure padding and look like "no
+        reply" before the fifth resynchronises.
+
+        Safe to run immediately after the read because the whole 256 bytes
+        arrive in a single TCP segment -- measured, one recv -- so the padding
+        is already buffered by the time readexactly returns.
+
+        Opt-in rather than automatic: ``StreamReader.read`` WAITS on an empty
+        buffer rather than returning, so an unconditional drain would spend its
+        timeout on every command. At 13 commands a cycle that is most of a
+        second per poll, for padding that only two or three opcodes produce.
+        """
+        assert self._reader is not None
+        dropped = 0
+        while True:
+            try:
+                async with asyncio.timeout(STALE_DRAIN_TIMEOUT):
+                    chunk = await self._reader.read(REPLY_LENGTH * 8)
+            except TimeoutError:
+                break
+            if not chunk:
+                break
+            dropped += len(chunk)
+            if chunk.strip(b"\x00"):
+                # Padding is all NUL. Anything else means a real frame was left
+                # behind, so the stream is out of step rather than merely
+                # padded, and continuing would read it as the next reply.
+                self._abort()
+                raise SonanceConnectionError(
+                    f"Discarded {dropped} unread byte(s) containing non-padding "
+                    "data; the reply stream was out of step, connection reset"
+                )
+        if dropped:
+            _LOGGER.debug("Discarded %d byte(s) of trailing frame padding", dropped)
+        return dropped
 
     def _desync(self, expected: int, got: str) -> None:
         """Abort the connection after a reply arrived for the wrong group."""
@@ -377,8 +432,17 @@ class SonanceProtocol:
 
     # --- source ------------------------------------------------------------
 
-    async def get_source(self, group: int) -> tuple[int, str] | None:
-        """Return (source number, source name) for a group."""
+    async def get_source(self, group: int) -> str | None:
+        """Return the NAME of the group's selected source.
+
+        The name, and deliberately not the number. ``Src1=`` is a fixed label:
+        selecting source 2 still answers ``Cmd:Source1 ,Group:D Src1=Input 2L``,
+        so the digit is 1 whatever is selected. Returning it would be returning
+        a value that is wrong three times out of four.
+
+        Resolve the number from the name via the HTTP channel layout --
+        ``Topology.source_number_for_input_name``.
+        """
         reply = await self._request(OP_QUERY_SOURCE, group, require_reply=False)
         if reply is None:
             return None
@@ -388,12 +452,18 @@ class SonanceProtocol:
             return None
         if match.group(1).upper() != GROUP_LETTERS[group]:
             self._desync(group, match.group(1))
-        return int(match.group(2)), match.group(3).strip()
+        return match.group(3).strip()
 
     async def set_source(self, group: int, source: int) -> None:
+        """Select a source for a group.
+
+        ``drain_after`` because this is the command measured to reply with 256
+        bytes rather than 50; without it the next four commands read its
+        padding instead of their own replies.
+        """
         if not 1 <= source <= SOURCE_COUNT:
             raise ValueError(f"Source must be 1-{SOURCE_COUNT}, got {source}")
-        await self._request(OP_SOURCE_BASE + source, group)
+        await self._request(OP_SOURCE_BASE + source, group, drain_after=True)
 
     # --- power -------------------------------------------------------------
 
@@ -463,15 +533,11 @@ class SonanceProtocol:
 
     async def read_group(self, group: int) -> GroupState:
         """Read the full TCP-visible state of one group."""
-        volume = await self.get_volume(group)
-        muted = await self.get_mute(group)
-        source = await self.get_source(group)
         return GroupState(
             group=group,
-            volume_db=volume,
-            muted=muted,
-            source=source[0] if source else None,
-            source_name=source[1] if source else None,
+            volume_db=await self.get_volume(group),
+            muted=await self.get_mute(group),
+            source_name=await self.get_source(group),
         )
 
 
