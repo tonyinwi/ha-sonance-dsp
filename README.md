@@ -24,7 +24,7 @@ behind a streamer at **fixed line-out** the amp is the only working volume in th
 > If it does not do what you need, fork it.
 
 **Status.** Volume, mute, source and upstream mirroring have run on a live install since
-0.2.0; zone power is new in 0.3.0.
+0.2.0; zone power since 0.3.0, with a silent power-up since 0.3.1.
 
 ## Supported devices
 
