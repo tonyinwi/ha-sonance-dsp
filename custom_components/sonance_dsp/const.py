@@ -186,16 +186,21 @@ AMP_POWER_READ_ATTEMPTS: Final = 3
 AMP_POWER_READ_INTERVAL: Final = 0.5
 # After switching a muted zone on, its mute is read back at these intervals
 # (cumulative 0.3, 0.6, 1.0, 1.5 s) and re-sent whenever it reads off.
-# Switching a zone on clears its mute; the clear was visible at the first
-# sample, about 0.5 s after the zone-on. A mute sent within one round trip of
-# the zone-on survived it in one test on an awake amp (2026-09-27); after a
-# wake that is unmeasured, and one sample is not a guarantee, so the restore is
-# verified rather than trusted.
+# The amp holds a zone's mute off from ~0.2 s to ~1.05 s after a zone-on and
+# re-applies it then (measured 2026-09-27); these reads span that window, so a
+# mute that did not come back is caught and re-sent.
 MUTE_VERIFY_DELAYS: Final = (0.3, 0.3, 0.4, 0.5)
 # Straight after a wake the window runs to 5 s. Mute writes sent during a boot
 # were lost while zone-on writes were kept, which fits the clear landing when a
 # zone actually powers up -- and just after "On", that may be later.
 MUTE_VERIFY_DELAYS_AFTER_WAKE: Final = (*MUTE_VERIFY_DELAYS, 1.5, 2.0)
+# After a zone-on the amp applies the zone's turn-on volume at ~0.2 s -- over any
+# volume sent before then -- and holds the zone's mute off until ~1.05 s, and that
+# window is AUDIBLE (measured 2026-09-27, by ear). Set every zone's turn-on volume
+# to -70 dB on the amp and the window is silent; the level the zone had before it
+# was switched off is then restored once the window has passed, and checked.
+VOLUME_RESTORE_AFTER: Final = 1.5
+VOLUME_CONFIRM_DELAYS: Final = (0.3, 0.3, 0.4)
 # How long unload waits for a power change in progress before disconnecting.
 # Cutting one off mid-wake leaves the zones a wake revived playing.
 CLOSE_WAIT: Final = WAKE_TIMEOUT + 15

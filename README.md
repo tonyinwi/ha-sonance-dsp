@@ -63,9 +63,10 @@ Range −70 to +12 dB. The slider tops out at a ceiling set in the options for a
 opt-in ([why](docs/design.md#volume)).
 
 > [!CAUTION]
-> Switching a zone on applies its **turn-on volume** (per zone in the amp's In/Out Settings
-> tab: a fixed level, or `LAST`), and the ceiling does not limit it. The factory value is
-> +12 dB.
+> For about a second after a zone is switched on, the amp plays it **unmuted at its
+> turn-on volume** (per zone, In/Out Settings tab; factory value +12 dB), whatever its mute
+> or the ceiling. **Set every zone's turn-on volume to −70 dB.** The integration then puts
+> the zone back at its previous level once that second has passed.
 
 ## Power
 
@@ -73,7 +74,7 @@ Home Assistant owns power, built around one failure: music starting where nobody
 it. That needs the amp's **Auto On method at Power Button, with every channel's sleep
 off**, so nothing wakes by itself. The integration does not check this.
 
-- Switching a zone on restores its mute, and checks it stuck.
+- Switching a zone on restores its mute and then its volume, and checks both.
 - Waking the amp takes about 10 s, and brings back only the zone asked for.
 - A zone already on is left alone.
 - Switching the last zone off puts the amp in standby.

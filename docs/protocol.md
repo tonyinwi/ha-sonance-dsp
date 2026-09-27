@@ -255,16 +255,22 @@ word there, and any status-page value but `on`/`off`, as unknown, never off.
 
 Measured:
 
-- **Switching a zone on clears its mute** and applies its turn-on volume. The clear was
-  visible at the first sample, about 0.5 s after the zone-on, and a mute sent about 0.5 s
-  after the zone-on stuck.
+- **A zone-on has an audible power-up window** (2026-09-27, zone D, 50 ms sampling, four
+  runs; heard by ear with a source playing):
 
-  **A mute sent within one round trip of the zone-on survives the clear** on an awake amp
-  (2026-09-27, v0.3.0, zone D, one sample): read back muted at 0.3, 0.6, 1.0 and 1.5 s,
-  and on the status page 3 s later. After a wake it is still unmeasured.
+  | After zone-on | The amp |
+  |---|---|
+  | ~0.2 s | applies the zone's **turn-on volume**, over any volume sent before it, and reports **mute off** |
+  | ~0.2–1.05 s | **plays unmuted at the turn-on volume**; a mute sent now changes nothing |
+  | ~1.05 s | re-applies a mute sent with the zone-on, without being asked again |
 
+  With the turn-on volume at −70 dB the same window was **inaudible** (by ear). Seen on
+  zones A–D, awake and straight after a wake.
+
+  *Corrected 2026-09-27:* PR #13 recorded "a mute sent straight after a zone-on survives"
+  from one sample, a zone off for only a few seconds; every later run showed the window.
   *Corrected 2026-09-26:* an earlier "re-muting immediately sticks" came from a probe that
-  waited 0.5 s per command, so its mute went out after the clear.
+  waited 0.5 s per command.
 - **Standby and wake do not clear mute.**
 - **A switched-off zone still answers** volume, mute and source queries, so answering does
   not mean on.
@@ -293,8 +299,9 @@ Not measured; the integration is built to be right either way
 ### Turn-on volume
 
 Per zone, in the In/Out tab: a fixed level, or `LAST` to keep the volume across a power
-cycle. A zone power-on over IP applies it; the manual mentions only the power switch and
-sleep. The web UI appears to store `LAST` as the out-of-range value `13` (inferred from its
+cycle. A zone power-on over IP applies it, about 0.2 s after the zone-on (above); the
+manual mentions only the power switch and sleep. Set over HTTP as `in-out-settings`
+`action=write&name=turn-on-volume&index=<channel>&value=<dB>`; read back to confirm. The web UI appears to store `LAST` as the out-of-range value `13` (inferred from its
 JavaScript, unverified).
 
 ## Push: tested, and it does not

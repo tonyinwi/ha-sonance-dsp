@@ -44,11 +44,9 @@ common source with `media_player.join`. Both follow from
   Power Button with channel sleep off, and nothing reads it. The key is `auto-on-method`
   (see protocol.md); which page carries it, and the channel-sleep key, are unverified. Read
   both at setup and raise a repair issue for anything else.
-- **Turn-on volume above the ceiling.** A zone's turn-on volume (factory default +12 dB)
-  can exceed the options-flow ceiling (default 0 dB), so switching it on lands above the
-  slider's 100%.
-  `turn-on-volumes` is parsed but unused. Warn at setup, or pull the level down after the
-  read-back.
+- **Check the turn-on volume at setup.** A zone-on plays ~1 s at the turn-on volume
+  whatever the mute; the documented setup is −70 dB. `turn-on-volumes` is parsed but
+  unused: raise a repair issue for any zone above −70.
 - **Measure what the code defends against blind**, listed under *not measured* in
   [Power: measured in Power Button mode](protocol.md#power-measured-in-power-button-mode).
   Each needs the amplifier and a go-ahead, with the source idle. Zone-on to a zone already

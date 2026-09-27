@@ -31,11 +31,14 @@ from .const import (
     GROUP_LETTERS,
     GROUP_POWER_STALE_AFTER,
     MAX_GROUPS,
+    MIN_VOLUME_DB,
     MUTE_VERIFY_DELAYS,
     MUTE_VERIFY_DELAYS_AFTER_WAKE,
     POLL_RETRY_AFTER,
     POWER_CONFIRM_INTERVAL,
     POWER_CONFIRM_TIMEOUT,
+    VOLUME_CONFIRM_DELAYS,
+    VOLUME_RESTORE_AFTER,
     WAKE_POLL_INTERVAL,
     WAKE_RETRY_HOLDOFF,
     WAKE_TIMEOUT,
@@ -360,9 +363,9 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
     # NOT measured, and written to be right either way rather than to depend
     # on:
     #
-    #   * whether a mute sent within one round trip of a zone-on survives the
-    #     clear straight after a wake (it did, once, on an awake amp) -- so the
-    #     mute is read back across the clear window and re-sent;
+    #   * whether the amp always re-applies a mute sent with the zone-on at the
+    #     end of the power-up window (seen every time, ~1.05 s) -- so the mute is
+    #     read back across the window and re-sent;
     #   * whether a zone-on sent to a zone that is ALREADY on re-applies its
     #     turn-on volume and clears its mute -- so it is never sent to one;
     #   * whether standby accepts a zone-off -- so zones are switched off both
@@ -370,8 +373,10 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
     #   * what power-on does to an amplifier that is already on -- so it is
     #     only ever sent to one that has just reported standby.
 
-    async def async_turn_on(self, group: int) -> None:
-        """Switch a zone on, restoring its mute.
+    async def async_turn_on(self, group: int, *, ceiling_db: int = 0) -> None:
+        """Switch a zone on, restoring its mute and then its volume.
+
+        ``ceiling_db`` caps the restored volume: the zone's configured ceiling.
 
         The work runs in its own task. A caller cancelled before anything was
         switched cancels the request; one cancelled after the zone-on does not
@@ -379,7 +384,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         the restore would leave the zone playing unmuted.
         """
         op = _PowerOp()
-        task = asyncio.ensure_future(self._async_turn_on(group, op))
+        task = asyncio.ensure_future(self._async_turn_on(group, op, ceiling_db))
         task.add_done_callback(partial(self._log_if_abandoned, group, op))
         try:
             # wait() rather than shield(): the task is not cancelled with the
@@ -402,7 +407,9 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                 err,
             )
 
-    async def _async_turn_on(self, group: int, op: _PowerOp) -> None:
+    async def _async_turn_on(
+        self, group: int, op: _PowerOp, ceiling_db: int
+    ) -> None:
         async with self.command_lock:
             self._check_open()
             if op.abandoned:
@@ -467,10 +474,11 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                     return
 
             restore = self._mute_to_restore(group, await self.client.get_mute(group))
+            level = await self._async_level_to_restore(group, ceiling_db)
             if op.abandoned:
                 return
             await self._async_switch_on(
-                group, restore, op, known_off, after_wake=not amp_on
+                group, restore, op, known_off, after_wake=not amp_on, level=level
             )
 
     async def _async_switch_on(
@@ -481,8 +489,9 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         known_off: set[int],
         *,
         after_wake: bool,
+        level: int | None,
     ) -> None:
-        """Send the zone-on, restore and verify the mute, and publish.
+        """Send the zone-on, restore the mute and then the volume, and publish.
 
         From the first zone-on onwards nothing is abandoned, and any failure
         leaves the zone silent rather than playing: if the sequence breaks with
@@ -538,17 +547,81 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                 power[other] = False
         if restore:
             self._mute_owed.discard(group)
-        # Switching on also applies the zone's turn-on volume, a fixed level or
-        # LAST depending on how the zone is set up. Read it back rather than
-        # assume either. The mute is what was sent and then verified.
+        # The mute is what was sent and then verified; the volume is read back.
         self._apply_power(
             group,
             zone_on=True,
             amp_on=True,
             power=power,
-            volume_db=await self._async_read_volume(group),
+            volume_db=await self._async_restore_level(group, level, waited=restore),
             muted=restore,
         )
+
+    async def _async_wait_for_power_up(self) -> None:
+        """Wait out a zone's power-up: turn-on volume at ~0.2 s, mute at ~1.05 s."""
+        await asyncio.sleep(VOLUME_RESTORE_AFTER)
+
+    async def _async_level_to_restore(self, group: int, ceiling_db: int) -> int | None:
+        """The volume to put back after a zone-on: the zone's level while off.
+
+        A switched-off zone still reports its volume, so this is read from the
+        amplifier like the mute, and survives a restart; the last polled value
+        is the fallback. Never above the ceiling. None when neither is known --
+        the zone then stays at its turn-on level.
+        """
+        try:
+            volume = await self.client.get_volume(group)
+        except SonanceError:
+            volume = None
+        if volume is None and self.data is not None:
+            state = self.data.groups.get(group)
+            volume = state.volume_db if state is not None else None
+        if volume is None:
+            return None
+        return max(MIN_VOLUME_DB, min(volume, ceiling_db))
+
+    async def _async_restore_level(
+        self, group: int, level: int | None, *, waited: bool
+    ) -> int | None:
+        """Put a switched-on zone back at ``level`` once its power-up has passed.
+
+        The amplifier applies the zone's turn-on volume about 0.2 s after the
+        zone-on, over anything sent before, so this waits out the power-up --
+        the mute check already has, when there was one -- and then sets the
+        level and reads it back. A restore that fails is logged, not raised: the
+        zone is on, and at its turn-on level, which is the silent one when the
+        amplifier is set up as recommended.
+        """
+        if level is None:
+            return await self._async_read_volume(group)
+        if not waited:
+            await self._async_wait_for_power_up()
+        letter = GROUP_LETTERS[group]
+        current: int | None = None
+        try:
+            # Done only when the level still reads back after a pause, so a
+            # power-up slower than expected cannot land its turn-on volume
+            # after a check that had already passed.
+            for delay in VOLUME_CONFIRM_DELAYS:
+                if await self.client.get_volume(group) != level:
+                    await self.client.set_volume(group, level)
+                await asyncio.sleep(delay)
+                current = await self.client.get_volume(group)
+                if current == level:
+                    self._volume_unverified.discard(group)
+                    return level
+        except SonanceError as err:
+            _LOGGER.warning(
+                "Could not restore zone %s's volume to %s dB (%s)", letter, level, err
+            )
+            return await self._async_read_volume(group)
+        _LOGGER.warning(
+            "Zone %s's volume did not hold at %s dB after switching on; it reads %s",
+            letter,
+            level,
+            current,
+        )
+        return await self._async_read_volume(group)
 
     async def _async_fail_safe(
         self, group: int, restore: bool, op: _PowerOp, known_off: set[int]
