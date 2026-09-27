@@ -90,9 +90,12 @@ async def test_sleep_on_any_channel_is_an_issue(hass: HomeAssistant) -> None:
     assert found.translation_placeholders["channels"] == "1 LEFT, 1 RIGHT"
 
 
-@pytest.mark.parametrize("level", ["-27", "13", "LAST", ""])
+@pytest.mark.parametrize(
+    ("level", "shown"),
+    [("-27", "-27 dB"), ("13", "LAST"), ("LAST", "LAST"), ("", "?")],
+)
 async def test_a_turn_on_volume_other_than_the_floor_is_an_issue(
-    hass: HomeAssistant, level: str
+    hass: HomeAssistant, level: str, shown: str
 ) -> None:
     """Including LAST (stored as 13, inferred) and anything unparseable."""
     volumes = ["-70"] * 2 + [level] * 2 + ["-70"] * 4
@@ -102,7 +105,7 @@ async def test_a_turn_on_volume_other_than_the_floor_is_an_issue(
 
     found = issue(hass, "turn_on_volume", entry)
     assert found is not None
-    assert found.translation_placeholders["zones"] == f"Deck ({level})"
+    assert found.translation_placeholders["zones"] == f"Deck ({shown})"
     assert found.translation_placeholders["silent"] == "-70"
 
 
@@ -195,3 +198,113 @@ async def test_setup_checks_now_and_daily(hass: HomeAssistant) -> None:
 
         await hass.config_entries.async_remove(entry.entry_id)
         assert issue(hass, "auto_on_method", entry) is None  # removal drops it
+
+
+
+# ---------------------------------------------------------------------------
+# Failure paths: never take setup down, never clear on a non-reading
+# ---------------------------------------------------------------------------
+
+
+async def test_an_unexpected_error_is_logged_not_raised(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    entry, c = make(hass)
+    c.http.power_setup.side_effect = TypeError("malformed")
+
+    await async_check_setup(hass, entry, c)
+
+    assert "Checking the amplifier's power settings failed" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        PowerSetup(auto_on_method=None, sleep=[], sleep_titles=[]),
+    ],
+)
+async def test_an_answer_without_the_keys_keeps_existing_issues(
+    hass: HomeAssistant, answer: PowerSetup
+) -> None:
+    """Not read is not fixed."""
+    entry, c = make(
+        hass,
+        PowerSetup("Audio", ["After 3 HRS"] * 8, TITLES),
+        replace(TOPOLOGY, turn_on_volumes=["-27"] * 8),
+    )
+    await async_check_setup(hass, entry, c)
+
+    c.http.power_setup.return_value = answer
+    c.http.topology.return_value = replace(TOPOLOGY, turn_on_volumes=[])
+    await async_check_setup(hass, entry, c)
+
+    for key in ("auto_on_method", "channel_sleep", "turn_on_volume"):
+        assert issue(hass, key, entry) is not None, key
+
+
+async def test_one_page_failing_does_not_skip_the_other(hass: HomeAssistant) -> None:
+    entry, c = make(hass, replace(GOOD, auto_on_method="Audio"))
+    c.http.topology.side_effect = SonanceHttpError("down")
+
+    await async_check_setup(hass, entry, c)
+
+    assert issue(hass, "auto_on_method", entry) is not None
+
+
+async def test_short_titles_still_report_sleeping_channels(hass: HomeAssistant) -> None:
+    entry, c = make(hass, PowerSetup("Power Button", ["After 3 HRS"] * 8, []))
+
+    await async_check_setup(hass, entry, c)
+
+    found = issue(hass, "channel_sleep", entry)
+    assert found is not None
+    assert found.translation_placeholders["channels"].startswith("channel 1, channel 2")
+
+
+async def test_issues_survive_a_restart(hass: HomeAssistant) -> None:
+    entry, c = make(hass, replace(GOOD, auto_on_method="Audio"))
+
+    await async_check_setup(hass, entry, c)
+
+    assert issue(hass, "auto_on_method", entry).is_persistent is True
+
+
+async def test_a_dismissed_issue_returns_when_more_zones_join_it(
+    hass: HomeAssistant,
+) -> None:
+    volumes = ["-27", "-27"] + ["-70"] * 6
+    entry, c = make(hass, topology=replace(TOPOLOGY, turn_on_volumes=volumes))
+    await async_check_setup(hass, entry, c)
+    ir.async_get(hass).async_ignore(DOMAIN, f"turn_on_volume_{entry.entry_id}", True)
+    assert issue(hass, "turn_on_volume", entry).dismissed_version is not None
+
+    c.http.topology.return_value = replace(
+        TOPOLOGY, turn_on_volumes=["-27"] * 4 + ["-70"] * 4
+    )
+    await async_check_setup(hass, entry, c)
+
+    assert issue(hass, "turn_on_volume", entry).dismissed_version is None
+
+
+async def test_a_dismissed_issue_stays_dismissed_when_nothing_changed(
+    hass: HomeAssistant,
+) -> None:
+    volumes = ["-27", "-27"] + ["-70"] * 6
+    entry, c = make(hass, topology=replace(TOPOLOGY, turn_on_volumes=volumes))
+    await async_check_setup(hass, entry, c)
+    ir.async_get(hass).async_ignore(DOMAIN, f"turn_on_volume_{entry.entry_id}", True)
+
+    await async_check_setup(hass, entry, c)
+
+    assert issue(hass, "turn_on_volume", entry).dismissed_version is not None
+
+
+async def test_general_settings_failing_does_not_skip_the_turn_on_check(
+    hass: HomeAssistant,
+) -> None:
+    entry, c = make(hass, topology=replace(TOPOLOGY, turn_on_volumes=["-27"] * 8))
+    c.http.power_setup.side_effect = SonanceHttpError("down")
+
+    await async_check_setup(hass, entry, c)
+
+    assert issue(hass, "turn_on_volume", entry) is not None

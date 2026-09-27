@@ -223,18 +223,26 @@ class SonanceHttpApi:
     async def power_setup(self) -> PowerSetup:
         """Read Auto On and the per-channel sleep settings (general-settings)."""
         data = await self._read(HTTP_PAGE_GENERAL)
+
+        def listed(key: str) -> list:
+            value = data.get(key)
+            return value if isinstance(value, list) else []
+
         names = {
             str(item.get("value")): str(item.get("name"))
-            for item in data.get("audio-off-delay-items") or []
+            for item in listed("audio-off-delay-items")
             if isinstance(item, dict)
         }
         method = str(data.get("auto-on-method") or "").strip() or None
+        # Without the item names a sleep value is only an index; better unknown
+        # than a guess that reads every channel as asleep.
+        sleep = [names[str(v)] for v in listed("audio-off-delay") if str(v) in names]
+        if len(sleep) != len(listed("audio-off-delay")):
+            sleep = []
         return PowerSetup(
             auto_on_method=method,
-            sleep=[
-                names.get(str(v), str(v)) for v in data.get("audio-off-delay") or []
-            ],
-            sleep_titles=[str(t) for t in data.get("audio-off-delay-titles") or []],
+            sleep=sleep,
+            sleep_titles=[str(t) for t in listed("audio-off-delay-titles")],
         )
 
     async def group_power(self) -> dict[int, bool]:

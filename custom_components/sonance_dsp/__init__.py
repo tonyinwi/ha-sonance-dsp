@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta
 
 from homeassistant.const import CONF_HOST, CONF_PORT, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_track_time_interval
@@ -67,11 +67,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: SonanceConfigEntry) -> b
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
     # The amplifier settings power control depends on: checked now and daily,
-    # because a factory reset or a web-UI change undoes them silently.
-    await async_check_setup(hass, entry, coordinator)
+    # because a factory reset or a web-UI change undoes them silently. In the
+    # background, owned by the entry: setup does not wait on it, and unload
+    # cancels a check still running.
+    def _check() -> None:
+        entry.async_create_background_task(
+            hass, async_check_setup(hass, entry, coordinator), "sonance_dsp setup check"
+        )
 
-    async def _recheck(_now: datetime) -> None:
-        await async_check_setup(hass, entry, coordinator)
+    _check()
+
+    @callback
+    def _recheck(_now: datetime) -> None:
+        _check()
 
     entry.async_on_unload(
         async_track_time_interval(hass, _recheck, SETUP_CHECK_INTERVAL)

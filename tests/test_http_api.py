@@ -755,3 +755,25 @@ async def test_power_setup_without_the_keys_is_unknown_not_wrong(
 
     assert setup.auto_on_method is None
     assert setup.sleep == []
+
+
+
+async def test_power_setup_without_item_names_leaves_sleep_unknown(
+    amp: AiohttpClientMocker, api: SonanceHttpApi
+) -> None:
+    """A bare index is not a setting: better unknown than every channel asleep."""
+    amp.get(
+        GENERAL, json={"auto-on-method": "Power Button", "audio-off-delay": [1] * 8}
+    )
+
+    assert (await api.power_setup()).sleep == []
+
+
+async def test_power_setup_tolerates_scalars_where_lists_belong(
+    amp: AiohttpClientMocker, api: SonanceHttpApi
+) -> None:
+    amp.get(GENERAL, json={"audio-off-delay": 1, "audio-off-delay-items": 3})
+
+    setup = await api.power_setup()
+
+    assert setup.sleep == []
