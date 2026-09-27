@@ -98,8 +98,26 @@ audio, **each zone is an independent player** with its own source, volume, mute 
 and zones on one source share its playback.
 
 That fits the standard `media_player`: source selection routes the amp, power switches the
-zone, and mirroring shows the source's track; transport pass-through and
-`media_player.join` fit the same model ([roadmap](roadmap.md#transport-and-grouping)).
+zone, mirroring shows the source's track, and transport passes to the source's player;
+`media_player.join` fits the same model ([roadmap](roadmap.md#transport-and-grouping)).
+
+**Transport only while the zone is on.** Play, pause and stop go to the linked player, and
+the zone offers those the player does. An off zone offers none: playback belongs to the
+source, so "play" there would start every other zone on it and leave this one silent. Home
+Assistant rejects a control an entity does not offer, so the integration's own refusal
+only catches a call queued before the zone went off.
+
+- **No skip.** Every zone on a source would forward it, so one "next track" sent to the
+  streamer and its zones (Assist, an area, a group) would skip once per player.
+- **Loops are dropped.** A link into this integration is not followed. A forward that comes
+  back through another player, such as a group containing the zone, carries the context
+  the zone gave it, and is dropped.
+- **Muted is not off.** A muted zone offers play: mute is a listening control on a zone that
+  is on, and the source-wide effect is the rule above.
+- **Scenes and toggles act on the source.** Restoring a zone captured as paused pauses every
+  zone on its source, and play/pause toggled on two zones at once can cancel out.
+- **Features follow power**, so each zone on/off rewrites the entity registry and reloads
+  the zone's HomeKit accessory. Expected, not a bug.
 There is no second kind of entity, and no "volume" averaged from other volumes, which
 [`gain-offset`](protocol.md#http-endpoints) would make meaningless.
 
@@ -227,9 +245,9 @@ including what was not measured.
   error is raised.
 - **Everything waits for the boot.** From standby, turn-on sends power-on, then only status
   queries until the amplifier reports `On` (~10 s). Every write holds the coordinator's
-  command lock, and a power change holds it throughout. `PARALLEL_UPDATES` is not enough,
-  because Assist's relative-volume intent calls entity methods directly. Zones switched on
-  together share one wake.
+  command lock, and a power change holds it throughout. `PARALLEL_UPDATES` is 0: Assist's
+  relative-volume intent bypasses it anyway, and a limit of 1 would be held across
+  transport calls to other players. Zones switched on together share one wake.
 - **Volume steps start from a fresh read.** Up and down read the level inside the lock, so
   a step after a wake starts from the turn-on volume and a stale cache never turns a step
   into a jump. Without a reading the device's own step is sent, except upward when the last

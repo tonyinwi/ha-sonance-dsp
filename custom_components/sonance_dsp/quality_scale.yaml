@@ -49,7 +49,12 @@ rules:
   entity-unavailable: todo
   integration-owner: done
   log-when-unavailable: todo
-  parallel-updates: todo
+  parallel-updates:
+    status: done
+    comment: >-
+      0. The coordinator's command lock sends one amplifier command at a time; a
+      platform-wide limit would also be held across transport calls to other
+      integrations' players.
   reauthentication-flow:
     status: exempt
     comment: The amplifier has no authentication.

@@ -1,6 +1,6 @@
 [project]
 name = "ha-sonance-dsp"
-version = "0.3.4"
+version = "0.4.0"
 description = "Home Assistant integration for Sonance DSP amplifiers over IP"
 requires-python = ">=3.13"
 

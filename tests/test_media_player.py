@@ -19,9 +19,13 @@ from homeassistant.components.media_player import (
     MediaPlayerEntityFeature,
     MediaPlayerState,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ServiceValidationError
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.core import Context, HomeAssistant
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import entity_registry as er
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_mock_service,
+)
 
 from custom_components.sonance_dsp.const import DOMAIN
 from custom_components.sonance_dsp.coordinator import SonanceCoordinator, SonanceData
@@ -321,3 +325,158 @@ def test_zone_that_did_not_answer_has_no_state(
     z = zone(coordinator, hass)
     assert z.state is None
     assert z.volume_level is None
+
+
+# ---------------------------------------------------------------------------
+# Transport pass-through
+# ---------------------------------------------------------------------------
+
+UPSTREAM_FEATURES = int(
+    MediaPlayerEntityFeature.PLAY
+    | MediaPlayerEntityFeature.PAUSE
+    | MediaPlayerEntityFeature.NEXT_TRACK  # never passed on: see below
+    | MediaPlayerEntityFeature.PREVIOUS_TRACK
+    | MediaPlayerEntityFeature.SHUFFLE_SET
+)
+TRANSPORT = (
+    MediaPlayerEntityFeature.PLAY
+    | MediaPlayerEntityFeature.PAUSE
+    | MediaPlayerEntityFeature.STOP
+)
+
+
+def linked_zone(coordinator, hass, state="playing", features=UPSTREAM_FEATURES):
+    hass.states.async_set(
+        "media_player.streamer", state, {"supported_features": features}
+    )
+    z = zone(coordinator, hass, links={"1": "media_player.streamer"})
+    z._resubscribe()
+    return z
+
+
+async def test_a_zone_offers_the_transport_its_player_offers(
+    coordinator: SonanceCoordinator, hass: HomeAssistant
+) -> None:
+    z = linked_zone(coordinator, hass)
+
+    offered = z.supported_features & TRANSPORT
+    assert offered == MediaPlayerEntityFeature.PLAY | MediaPlayerEntityFeature.PAUSE
+    assert z.supported_features & MediaPlayerEntityFeature.TURN_ON
+    assert not z.supported_features & MediaPlayerEntityFeature.SHUFFLE_SET
+
+
+def test_skip_is_never_offered(
+    coordinator: SonanceCoordinator, hass: HomeAssistant
+) -> None:
+    """Every zone on a source would forward it: one "next" would skip per zone."""
+    z = linked_zone(coordinator, hass)
+
+    assert not z.supported_features & (
+        MediaPlayerEntityFeature.NEXT_TRACK | MediaPlayerEntityFeature.PREVIOUS_TRACK
+    )
+
+
+@pytest.mark.parametrize(
+    "setup",
+    ["zone_off", "amp_standby", "power_unknown", "no_link", "unavailable"],
+)
+async def test_no_transport_unless_the_zone_is_on_and_linked(
+    coordinator: SonanceCoordinator, hass: HomeAssistant, setup: str
+) -> None:
+    state = "unavailable" if setup == "unavailable" else "playing"
+    z = linked_zone(coordinator, hass, state=state)
+    if setup == "zone_off":
+        coordinator.data.group_power[0] = False
+    elif setup == "amp_standby":
+        coordinator.data.amp_power = False
+    elif setup == "power_unknown":
+        coordinator.data.group_power = {}
+    elif setup == "no_link":
+        z = zone(coordinator, hass)
+
+    assert not z.supported_features & TRANSPORT
+
+
+@pytest.mark.parametrize(
+    ("method", "service"),
+    [
+        ("async_media_play", "media_play"),
+        ("async_media_pause", "media_pause"),
+        ("async_media_stop", "media_stop"),
+    ],
+)
+async def test_transport_goes_to_the_linked_player(
+    coordinator: SonanceCoordinator, hass: HomeAssistant, method: str, service: str
+) -> None:
+    calls = async_mock_service(hass, "media_player", service)
+    z = linked_zone(coordinator, hass, features=int(TRANSPORT))
+    context = Context(user_id="someone")
+    z.async_set_context(context)
+
+    await getattr(z, method)()
+
+    assert len(calls) == 1
+    assert calls[0].data == {"entity_id": "media_player.streamer"}
+    # A child context: attributed to the caller, and recognisable if it
+    # comes back.
+    assert calls[0].context.parent_id == context.id
+    assert calls[0].context.user_id == "someone"
+    assert calls[0].context.id != context.id
+
+
+async def test_a_call_carrying_a_forwarded_context_is_dropped(
+    coordinator: SonanceCoordinator, hass: HomeAssistant
+) -> None:
+    calls = async_mock_service(hass, "media_player", "media_play")
+    z = linked_zone(coordinator, hass)
+    z.async_set_context(Context())
+    await z.async_media_play()
+    z.async_set_context(calls[0].context)
+
+    await z.async_media_play()
+
+    assert len(calls) == 1
+
+
+async def test_transport_on_an_off_zone_is_refused(
+    coordinator: SonanceCoordinator, hass: HomeAssistant
+) -> None:
+    """It would play every other zone on the source; this one stays silent.
+
+    A service call is refused before this, as the feature is not offered; this
+    is a call queued before the zone went off.
+    """
+    calls = async_mock_service(hass, "media_player", "media_play")
+    z = linked_zone(coordinator, hass)
+    coordinator.data.group_power[0] = False
+
+    with pytest.raises(ServiceValidationError) as err:
+        await z.async_media_play()
+
+    assert err.value.translation_key == "transport_zone_off"
+    assert calls == []
+
+
+async def test_a_control_the_player_lacks_is_refused(
+    coordinator: SonanceCoordinator, hass: HomeAssistant
+) -> None:
+    calls = async_mock_service(hass, "media_player", "media_stop")
+    z = linked_zone(coordinator, hass)  # no STOP upstream
+
+    with pytest.raises(HomeAssistantError) as err:
+        await z.async_media_stop()
+
+    assert err.value.translation_key == "transport_unavailable"
+    assert calls == []
+
+
+async def test_a_link_into_this_integration_is_never_followed(
+    coordinator: SonanceCoordinator, hass: HomeAssistant
+) -> None:
+    """A zone linked to another zone would only lead back here."""
+    er.async_get(hass).async_get_or_create(
+        "media_player", DOMAIN, "loop", suggested_object_id="streamer"
+    )
+    z = linked_zone(coordinator, hass, features=int(TRANSPORT))
+
+    assert not z.supported_features & TRANSPORT

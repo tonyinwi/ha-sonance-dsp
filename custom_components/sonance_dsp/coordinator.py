@@ -134,10 +134,11 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         # Held for the whole of every write, and for the whole of a power
         # change -- which can include a ten-second wake. Two things need it.
         # A scene switching several zones on must share one wake rather than
-        # each sending its own power-on mid-boot. And Assist's relative-volume
-        # intent calls entity methods directly, bypassing PARALLEL_UPDATES, so
-        # without a lock of the coordinator's own a volume step sent during a
-        # wake is dropped by the booting amplifier while echoing success.
+        # each sending its own power-on mid-boot. And nothing else serialises
+        # writes (PARALLEL_UPDATES is 0, and Assist's relative-volume intent
+        # calls entity methods directly), so without it a volume step sent
+        # during a wake is dropped by the booting amplifier while echoing
+        # success.
         self.command_lock = asyncio.Lock()
         # Bumped by every locally applied change. A poll that was already
         # reading when one landed returns what it started with instead of its
