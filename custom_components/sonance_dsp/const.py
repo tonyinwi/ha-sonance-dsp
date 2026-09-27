@@ -190,9 +190,9 @@ AMP_POWER_READ_INTERVAL: Final = 0.5
 # re-applies it then (measured 2026-09-27); these reads span that window, so a
 # mute that did not come back is caught and re-sent.
 MUTE_VERIFY_DELAYS: Final = (0.3, 0.3, 0.4, 0.5)
-# Straight after a wake the window runs to 5 s. Mute writes sent during a boot
-# were lost while zone-on writes were kept, which fits the clear landing when a
-# zone actually powers up -- and just after "On", that may be later.
+# Straight after a wake the window runs to 5 s. The power-up window was measured
+# with the same timing after a wake as awake; the longer check is cheap
+# conservatism for the first zone of the day.
 MUTE_VERIFY_DELAYS_AFTER_WAKE: Final = (*MUTE_VERIFY_DELAYS, 1.5, 2.0)
 # After a zone-on the amp applies the zone's turn-on volume at ~0.2 s -- over any
 # volume sent before then -- and holds the zone's mute off until ~1.05 s, and that

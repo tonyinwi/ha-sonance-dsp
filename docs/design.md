@@ -255,6 +255,9 @@ including what was not measured.
 
 Known limits, each needing an unmeasured behaviour or an unlikely combination:
 
+- **A scene passes through the zone's old level.** HA reproduces a scene as `turn_on` then
+  `volume_set`, so a zone plays briefly at its restored level before the scene's own. In a
+  script, call `volume_set` before `turn_on`: the restore reads the off zone's level.
 - **Scene order affects latency.** Switching zone B, the last one playing, off before zone
   A on puts the amplifier in standby and then wakes it (~10 s). The end state is right.
   List the zones being switched on first.

@@ -288,8 +288,7 @@ Measured:
 Not measured; the integration is built to be right either way
 ([Power](design.md#power)):
 
-- **A mute sent straight after a zone-on, right after a wake.** Measured once awake (above).
-  The integration logs the delay whenever a read-back finds a restored mute lost.
+- **Whether a wake changes zone volumes.** The integration reads a zone's level before waking.
 - **Power-on to an amp already on**, and **standby to one already in standby.**
 - **Zone-on to a zone already on.** Only off-to-on was measured. If it too re-applies the
   turn-on volume and clears mute, a scene re-asserting "on" would reset a playing zone.

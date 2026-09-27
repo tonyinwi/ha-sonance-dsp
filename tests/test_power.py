@@ -19,7 +19,9 @@ the code under test is written to be right about either way:
 * a zone-on sent to a zone that is already on resets its volume and clears its
   mute just as it does from off (pessimistic)
 * a mute sent straight after a zone-on cancels the pending clear -- or, with
-  ``clear_overrides_mute``, does not, and the clear lands on top of it
+  ``clear_overrides_mute``, does not, and the clear lands on top of it. The
+  amp was measured doing neither exactly: it clears at ~0.2 s and re-applies
+  the mute itself at ~1.05 s. The two modes bracket that.
 * standby accepts and echoes zone commands, unless told otherwise
 
 Because the fake drops mid-boot commands and clears mute late, a regression
@@ -105,6 +107,8 @@ class FakeAmp:
         self._fail: list[str] = []
         self._not_sent: list[str] = []
         self.revive_on_wake: set[int] = set()
+        # Unmeasured: whether a wake resets zone volumes. Off by default.
+        self.wake_applies_turn_on_volume = False
         self.read_group_failures = 0
         self._pending_clear: dict[int, int] = {}
         self._pending_turn_on: dict[int, int] = {}
@@ -199,6 +203,9 @@ class FakeAmp:
                 self.master = True
                 for group in self.revive_on_wake:
                     self.group_power[group] = True
+                if self.wake_applies_turn_on_volume:
+                    for group in self.volume:
+                        self.volume[group] = self.turn_on_volume
             return False
         return self.master
 
@@ -1086,13 +1093,14 @@ async def test_a_turn_on_during_a_poll_is_not_overwritten(
     async def read_group(group: int) -> GroupState:
         state = await real(group)
         if group == 1:
-            await c.async_turn_on(0)
+            await c.async_turn_on(0, ceiling_db=-45)
         return state
 
     c.client.read_group = read_group
     data = await c._async_update_data()
 
-    assert data.groups[0].volume_db == -40
+    # -45 is the restore (capped); the poll read -40 before the turn-on.
+    assert data.groups[0].volume_db == -45
     assert data.group_power[0] is True
 
 
@@ -1569,14 +1577,16 @@ async def test_unload_waits_for_a_turn_on_in_progress(hass: HomeAssistant) -> No
 
 
 async def test_turn_on_asks_twice_for_the_volume(hass: HomeAssistant) -> None:
+    """On the already-on path, the only read is the refresh; one late reply."""
     amp = FakeAmp()
-    amp.group_power[3] = False
     c = make(hass, amp)
+    c.data.groups[3] = replace(c.data.groups[3], volume_db=-30)  # stale
     amp.unanswered_volume = 1
 
     await c.async_turn_on(3)
 
     assert c.data.groups[3].volume_db == -49
+    assert c.volume_verified(3)
 
 
 async def test_a_volume_step_starts_from_the_amp_not_the_cache(
@@ -2159,12 +2169,12 @@ async def test_an_unknown_level_leaves_the_turn_on_volume(hass: HomeAssistant) -
     c = make(hass, amp)
     c.data.groups[0] = replace(c.data.groups[0], volume_db=None)
     real = amp.get_volume
-    first = {"done": False}
+    reads = {"n": 0}
 
     async def get_volume(group: int) -> int | None:
-        if not first["done"]:
-            first["done"] = True
-            return None  # the read before the zone-on goes unanswered
+        reads["n"] += 1
+        if reads["n"] <= 2:
+            return None  # both reads before the zone-on go unanswered
         return await real(group)
 
     c.client.get_volume = get_volume
@@ -2172,7 +2182,24 @@ async def test_an_unknown_level_leaves_the_turn_on_volume(hass: HomeAssistant) -
     amp.settle()
 
     assert amp.volume[0] == -70
+    assert c.data.groups[0].volume_db == -70  # read after the power-up, not before
     assert not any(e.startswith("vol0:") for e in amp.log)
+
+
+async def test_one_unanswered_read_before_the_zone_on_is_asked_again(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp()
+    amp.turn_on_volume = -70
+    amp.group_power[0] = False
+    amp.volume[0] = -35
+    c = make(hass, amp)
+    amp.unanswered_volume = 1
+
+    await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
+
+    assert amp.volume[0] == -35
 
 
 async def test_a_turn_on_volume_landing_after_the_restore_is_overridden(
@@ -2265,3 +2292,76 @@ async def test_a_zone_already_on_is_not_restored(hass: HomeAssistant) -> None:
 
     assert amp.volume[0] == -35
     assert not any(e.startswith("vol0:") for e in amp.log)
+
+
+
+async def test_a_stale_cache_is_never_restored(hass: HomeAssistant) -> None:
+    """If the amp will not say, the zone stays at its silent turn-on level."""
+    amp = FakeAmp()
+    amp.turn_on_volume = -70
+    amp.group_power[0] = False
+    amp.volume[0] = -50
+    c = make(hass, amp)
+    c.data.groups[0] = replace(c.data.groups[0], volume_db=-20)  # louder, stale
+    amp.unanswered_volume = 2
+
+    await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
+
+    assert amp.volume[0] == -70
+    assert not any(e.startswith("vol0:") for e in amp.log)
+
+
+async def test_the_level_is_read_before_the_wake(hass: HomeAssistant) -> None:
+    """Whether a wake resets zone volumes is unmeasured; read it first."""
+    amp = FakeAmp(master=False)
+    amp.turn_on_volume = -70
+    amp.wake_applies_turn_on_volume = True
+    for g in amp.group_power:
+        amp.group_power[g] = False
+    amp.volume[0] = -35
+    c = make(hass, amp)
+
+    await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
+
+    assert amp.volume[0] == -35
+
+
+async def test_the_zone_is_shown_on_before_the_restore_makes_it_audible(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp()
+    amp.turn_on_volume = -70
+    amp.group_power[0] = False
+    amp.volume[0] = -35
+    c = make(hass, amp)
+    c.data.group_power[0] = False
+    seen: list[bool | None] = []
+    real = amp.set_volume
+
+    async def set_volume(group: int, db: int) -> None:
+        seen.append(c.data.group_power.get(group))
+        await real(group, db)
+
+    c.client.set_volume = set_volume
+    await c.async_turn_on(0, ceiling_db=0)
+
+    assert seen and all(seen)
+    assert c.volume_verified(0)
+    assert c.data.groups[0].volume_db == -35
+
+
+async def test_the_power_up_wait_is_real(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The seam FakeAmp replaces still waits the configured time in production."""
+    amp = FakeAmp()
+    c = make(hass, amp)
+    monkeypatch.setattr(coord_mod, "VOLUME_RESTORE_AFTER", 0.05)
+    loop = asyncio.get_running_loop()
+
+    start = loop.time()
+    await SonanceCoordinator._async_wait_for_power_up(c)
+
+    assert loop.time() - start >= 0.05
