@@ -13,7 +13,7 @@ from homeassistant.helpers.event import async_track_time_interval
 
 from .checks import async_check_setup, async_remove_issues
 from .const import DEFAULT_HTTP_PORT, DEFAULT_TCP_PORT
-from .coordinator import SonanceConfigEntry, SonanceCoordinator
+from .coordinator import SonanceConfigEntry, SonanceCoordinator, async_remove_holds
 from .http_api import SonanceHttpApi, SonanceHttpError
 from .protocol import SonanceConnectionError, SonanceProtocol
 
@@ -40,6 +40,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: SonanceConfigEntry) -> b
     try:
         await client.connect()
         await coordinator.async_discover()
+        await coordinator.async_load_holds()
     except SonanceConnectionError as err:
         await client.disconnect()
         raise ConfigEntryNotReady(f"Could not reach amplifier: {err}") from err
@@ -109,5 +110,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: SonanceConfigEntry) -> 
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: SonanceConfigEntry) -> None:
-    """Drop this amplifier's repair issues along with its entry."""
+    """Drop this amplifier's repair issues and saved zone state with its entry."""
     async_remove_issues(hass, entry)
+    await async_remove_holds(hass, entry)

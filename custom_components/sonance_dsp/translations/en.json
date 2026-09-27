@@ -69,9 +69,6 @@
     "zone_power_not_confirmed": {
       "message": "Zone {zone} did not report {state} after two attempts."
     },
-    "zone_power_unknown": {
-      "message": "The amplifier is on, but zone {zone}'s power could not be read from its status page, so it was not switched on: it may already be playing, and switching it on again could reset its volume. Try again once the status page answers."
-    },
     "mute_unknown": {
       "message": "Zone {zone} did not say whether it is muted, so its volume was not changed: on this amplifier a volume change un-mutes. Try again."
     }

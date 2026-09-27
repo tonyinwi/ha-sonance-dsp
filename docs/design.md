@@ -191,8 +191,8 @@ including what was not measured.
   muted keeps its silent turn-on level with its own level held, and a hold survives off/on
   cycles; the restore after an unmuted switch-on re-reads the mute before each write. A
   failed unmute shows the mute as unknown, never "muted". A zone un-muted outside HA
-  drops its hold. Holds are in memory, so a restart loses them and the zone keeps the
-  level the amp reports.
+  drops its hold. Holds, and owed mutes, are saved to Home Assistant's storage and
+  reloaded at setup, so a restart keeps them; removing the entry deletes them.
 - **Switching on restores the mute, and checks it stuck.** The mute is read while the zone
   is off (it keeps it there) and sent straight after the zone-on, both frames under one
   hold of the protocol lock. It is read back at 0.3, 0.6, 1.0 and 1.5 s (to 5 s after a
@@ -212,11 +212,10 @@ including what was not measured.
   `turn_on` without checking, and whether a zone-on resets a playing zone's volume is
   unmeasured. Judged from a fresh amplifier read and the status page, or the last known
   zone power when the page is down.
-- **Unknown is not guessed.** If amplifier power is unreadable after three tries, nothing
-  is switched: power-on to an amp already on was never measured. If the amp is on but the
-  zone's power is unknown (the page down past the carry-forward bound), the zone is not
-  switched on: it may be playing. *This one is a choice:* it blocks turn-on during a long
-  page outage, and measuring a zone-on to a zone already on would settle it.
+- **Unknown amplifier power is not guessed.** If it is unreadable after three tries,
+  nothing is switched: power-on to an amp already on was never measured. Unknown *zone*
+  power on an awake amp is different: a zone-on to a zone already on does nothing
+  (measured), so the zone is simply switched on.
 - **Waking brings back only the zone asked for.** A wake revives every zone that was on
   when something else put the amp to sleep, and all of them show off while it sleeps. So
   flagged zones, the requested one included, are switched off before the wake and again

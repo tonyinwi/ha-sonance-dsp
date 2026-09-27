@@ -41,11 +41,20 @@ from homeassistant.components.media_player import MediaPlayerState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import UpdateFailed
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+)
 
 from custom_components.sonance_dsp import coordinator as coord_mod
 from custom_components.sonance_dsp.const import DOMAIN
-from custom_components.sonance_dsp.coordinator import SonanceCoordinator, SonanceData
+from custom_components.sonance_dsp.coordinator import (
+    SonanceCoordinator,
+    SonanceData,
+    async_remove_holds,
+    holds_store_key,
+)
 from custom_components.sonance_dsp.http_api import (
     AmplifierIdentity,
     SonanceHttpError,
@@ -223,11 +232,12 @@ class FakeAmp:
         self._tick(entry)
         if self._ignored(entry):
             return
+        was_on = self.group_power[group]
         self.group_power[group] = on
-        if on:
+        if on and not was_on:
             # Measured from off: a moment later the zone's turn-on volume
-            # lands, over any volume sent before it, and its mute clears.
-            # Assumed from on as well.
+            # lands, over any volume sent before it, and its mute clears. To a
+            # zone already on, a zone-on does nothing (measured 2026-09-27).
             self._pending_turn_on[group] = self.MUTE_CLEAR_LAG
             self._pending_clear[group] = self.MUTE_CLEAR_LAG
         self._no_echo(entry)
@@ -333,9 +343,12 @@ def fast_timing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(coord_mod, "AMP_POWER_READ_INTERVAL", 0)
 
 
-def make(hass: HomeAssistant, amp: FakeAmp) -> SonanceCoordinator:
-    entry = MockConfigEntry(domain=DOMAIN, unique_id=IDENTITY.serial, data={})
-    entry.add_to_hass(hass)
+def make(
+    hass: HomeAssistant, amp: FakeAmp, entry: MockConfigEntry | None = None
+) -> SonanceCoordinator:
+    if entry is None:
+        entry = MockConfigEntry(domain=DOMAIN, unique_id=IDENTITY.serial, data={})
+        entry.add_to_hass(hass)
     client = MagicMock()
     for name in ("get_amp_power", "set_amp_power", "set_group_power",
                  "set_group_power_muted", "set_mute", "set_volume", "set_source",
@@ -1821,20 +1834,125 @@ async def test_turn_off_in_standby_without_the_page_leaves_the_flag_unknown(
     assert c.data.amp_power is False
 
 
-async def test_turn_on_refuses_a_zone_whose_power_is_unknown_on_an_awake_amp(
-    hass: HomeAssistant,
+@pytest.mark.parametrize("muted", [False, True], ids=["playing", "muted"])
+async def test_a_zone_whose_power_is_unknown_is_switched_on_harmlessly(
+    hass: HomeAssistant, muted: bool
 ) -> None:
-    """It may be playing, and a zone-on may reset its volume."""
+    """A zone-on to a zone already on does nothing (measured), so no refusal."""
     amp = FakeAmp()
+    amp.volume[0] = -35
+    amp.mute[0] = muted
     c = make(hass, amp)
     c.data.group_power = {}
     amp.http_up = False
 
-    with pytest.raises(HomeAssistantError) as err:
-        await c.async_turn_on(0)
+    await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
 
-    assert err.value.translation_key == "zone_power_unknown"
-    assert [e for e in amp.log if not e.startswith("q:")] == []
+    assert "group0:on" in amp.log
+    assert amp.volume[0] == -35
+    assert amp.mute[0] is muted
+    assert c.data.group_power[0] is True
+
+
+# ---------------------------------------------------------------------------
+# Held levels and owed mutes survive a restart
+# ---------------------------------------------------------------------------
+
+
+async def _flush_store(hass: HomeAssistant) -> None:
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=5))
+    await hass.async_block_till_done()
+
+
+async def test_a_hold_survives_a_restart(
+    hass: HomeAssistant, hass_storage: dict
+) -> None:
+    amp = FakeAmp()
+    amp.turn_on_volume = -70
+    amp.group_power[0] = False
+    amp.volume[0] = -35
+    amp.mute[0] = True
+    c = make(hass, amp)
+    await c.async_turn_on(0, ceiling_db=0)
+    await _flush_store(hass)
+
+    again = make(hass, amp, entry=c.config_entry)
+    await again.async_load_holds()
+
+    assert again.held_level(0) == -35
+
+
+async def test_an_owed_mute_survives_a_restart(
+    hass: HomeAssistant, hass_storage: dict
+) -> None:
+    amp = FakeAmp()
+    c = make(hass, amp)
+    c._owe_mute(2)
+    await _flush_store(hass)
+
+    again = make(hass, amp, entry=c.config_entry)
+    await again.async_load_holds()
+
+    assert again._mute_to_restore(2, False) is True
+
+
+async def test_saved_state_for_unknown_zones_or_levels_is_dropped(
+    hass: HomeAssistant, hass_storage: dict
+) -> None:
+    amp = FakeAmp()
+    c = make(hass, amp)
+    key = holds_store_key(c.config_entry.entry_id)
+    hass_storage[key] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": key,
+        "data": {
+            "held_level": {"0": -35, "7": -20, "1": 99},
+            "mute_owed": [2, 6],
+        },
+    }
+
+    await c.async_load_holds()
+
+    assert c.held_level(0) == -35
+    assert c.held_level(1) is None  # out of range
+    assert c.held_level(7) is None  # not a zone here
+    assert c._mute_owed == {2}
+
+
+async def test_unreadable_saved_state_is_ignored(
+    hass: HomeAssistant, hass_storage: dict, caplog: pytest.LogCaptureFixture
+) -> None:
+    amp = FakeAmp()
+    c = make(hass, amp)
+    key = holds_store_key(c.config_entry.entry_id)
+    hass_storage[key] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": key,
+        "data": {"held_level": {"A": "loud"}},
+    }
+
+    await c.async_load_holds()
+
+    assert c.held_level(0) is None
+    assert "Ignoring unreadable saved zone state" in caplog.text
+
+
+async def test_removing_the_entry_deletes_its_saved_state(
+    hass: HomeAssistant, hass_storage: dict
+) -> None:
+    amp = FakeAmp()
+    c = make(hass, amp)
+    c._set_hold(0, -35)
+    await _flush_store(hass)
+    key = holds_store_key(c.config_entry.entry_id)
+    assert key in hass_storage
+
+    await async_remove_holds(hass, c.config_entry)
+
+    assert key not in hass_storage
 
 
 async def test_a_mute_owed_from_a_failed_switch_on_is_restored_next_time(
@@ -2752,3 +2870,35 @@ async def test_a_poll_does_not_make_an_unanswered_group_look_answered(
     c.data = await c._async_update_data()
 
     assert c.data.groups[0].volume_db is None
+
+
+async def test_a_dropped_hold_stays_dropped_after_a_restart(
+    hass: HomeAssistant, hass_storage: dict
+) -> None:
+    amp = FakeAmp()
+    c = make(hass, amp)
+    c._set_hold(0, -35)
+    await _flush_store(hass)
+    c._drop_hold(0)
+    await _flush_store(hass)
+
+    again = make(hass, amp, entry=c.config_entry)
+    await again.async_load_holds()
+
+    assert again.held_level(0) is None
+
+
+async def test_a_settled_mute_stays_settled_after_a_restart(
+    hass: HomeAssistant, hass_storage: dict
+) -> None:
+    amp = FakeAmp()
+    c = make(hass, amp)
+    c._owe_mute(1)
+    await _flush_store(hass)
+    c._settle_mute(1)
+    await _flush_store(hass)
+
+    again = make(hass, amp, entry=c.config_entry)
+    await again.async_load_holds()
+
+    assert again._mute_owed == set()
