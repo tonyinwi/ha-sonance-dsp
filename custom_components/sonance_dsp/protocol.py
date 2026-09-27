@@ -401,8 +401,7 @@ class SonanceProtocol:
 
         Distinguishing this from silence is what turns an unverified reply
         format into a one-line bug report rather than a permanently dead
-        control. Mute and source formats have no recorded device literal behind
-        them.
+        control.
         """
         where = f" for group {GROUP_LETTERS[group]}" if group is not None else ""
         _LOGGER.warning(

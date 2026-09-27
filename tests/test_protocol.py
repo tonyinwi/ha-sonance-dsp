@@ -44,13 +44,12 @@ VOLUME_QUERY_REPLY = "Cmd:Volume      ,Group:D Vol=-27 db"
 VOLUME_ECHO_REPLY = "Cmd:VolumeUP   ,Group:D Vol=-27db"
 AMP_POWER_REPLY = "Power status :On"
 
-# Mute and source replies are NOT captured verbatim in docs/protocol.md; these
-# follow the documented "Cmd:<name><pad>,Group:<letter> <field>" shape in both
-# padding variants. Weaker evidence than the volume literals, and flagged as
-# such so nobody mistakes them for measurements.
-MUTE_QUERY_REPLY = "Cmd:Mute        ,Group:D Mute=on"
-MUTE_ECHO_REPLY = "Cmd:MuteOFF    ,Group:D Mute=off"
-SOURCE_QUERY_REPLY = "Cmd:Source      ,Group:D Src2=Streamer L Digital"
+# Query replies captured from the device (2026-09-20); input names genericised.
+MUTE_QUERY_REPLY = "Cmd:MuteState   ,Group:D Mute=on"
+MUTE_QUERY_REPLY_OFF = "Cmd:MuteState   ,Group:A Mute=off"
+SOURCE_QUERY_REPLY = "Cmd:Source1     ,Group:D Src1=Streamer L Digital"
+# NOT captured: a source-change echo. It follows the documented shape and is
+# weaker evidence than the literals above.
 SOURCE_ECHO_REPLY = "Cmd:Source2    ,Group:B Src2=Input 2"
 
 # --- frames ----------------------------------------------------------------
@@ -253,7 +252,7 @@ def test_re_volume_spans_the_whole_device_range() -> None:
 
 @pytest.mark.parametrize(
     ("reply", "group", "state"),
-    [(MUTE_QUERY_REPLY, "D", "on"), (MUTE_ECHO_REPLY, "D", "off")],
+    [(MUTE_QUERY_REPLY, "D", "on"), (MUTE_QUERY_REPLY_OFF, "A", "off")],
 )
 def test_re_mute_matches(reply: str, group: str, state: str) -> None:
     match = const.RE_MUTE.search(reply)
@@ -264,7 +263,7 @@ def test_re_mute_matches(reply: str, group: str, state: str) -> None:
 @pytest.mark.parametrize(
     ("reply", "expected"),
     [
-        (SOURCE_QUERY_REPLY, ("D", "2", "Streamer L Digital")),
+        (SOURCE_QUERY_REPLY, ("D", "1", "Streamer L Digital")),
         (SOURCE_ECHO_REPLY, ("B", "2", "Input 2")),
     ],
 )

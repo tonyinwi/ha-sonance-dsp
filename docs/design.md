@@ -1,453 +1,317 @@
 # Design
 
-Why the integration is shaped the way it is. The protocol itself is in
-[`protocol.md`](protocol.md); this document is about the decisions layered on top, and
-which of them are forced by the hardware rather than chosen.
-
-Most of what follows is forced. That is the point of having reverse-engineered the device
-first: several obvious designs are wrong here, and wrong in ways that do not show up until
-they are in production.
+Decisions and why. Device facts and their evidence are in [`protocol.md`](protocol.md);
+most of what follows is forced by them rather than chosen.
 
 ## Scope
 
-Local control of a Sonance DSP amplifier: per-zone volume, mute, source and power, exposed
-as `media_player` entities, with zones discovered from the device rather than configured by
-hand.
+Local control of a Sonance DSP amplifier: per-zone volume, mute, source and power as
+`media_player` entities, with zones discovered from the device.
 
-**Non-goals**, deliberately:
+**Non-goals:**
 
-- **Audio streaming.** The amplifier has no network audio input — only line inputs from two
-  modular slots. It amplifies whatever is wired to it. It cannot be a Music Assistant
-  player or a Squeezelite target, and no amount of integration work changes that.
-- **DSP tuning.** Crossovers, EQ curves and speaker presets are configured in the
-  amplifier's own web UI, by someone who knows what the speakers are. Exposing a 50-entry
-  preset list to an automation engine invites a mistake with a physical consequence.
+- **Audio streaming.** The amplifier has only line inputs, no network audio. It cannot be
+  a Music Assistant or Squeezelite player.
+- **DSP tuning.** Crossovers, EQ and speaker presets belong in the amplifier's web UI, set
+  by someone who knows the speakers. A preset list in an automation engine invites a
+  mistake with a physical consequence.
 - **Channel-to-group assignment.** See [Forbidden operations](#forbidden-operations).
 
 ## Two transports
 
-The amplifier answers on TCP 52000 and HTTP 80, and neither alone is sufficient.
+**TCP 52000 for writes and fast state. HTTP 80 for identity, names, the channel map and
+zone power**; TCP cannot read identity or zone power at all. What each port can do is in
+[`protocol.md`](protocol.md).
 
-| | TCP 52000 | HTTP 80 |
-|---|---|---|
-| Set volume / mute / source / power | ✅ | — |
-| Read volume / mute / source | ✅ | partial |
-| **Read per-group power** | ❌ *no such opcode* | ✅ |
-| Serial, model, firmware | ❌ | ✅ |
-| Zone and source **names** | partial | ✅ |
-| Channel→group map | "empty or not" | ✅ authoritative |
+The HTTP JSON API is undocumented (found in the web UI's JavaScript), so a firmware update
+could move it. Setup needs it, because the serial is the identity. The channel map is read
+once, at setup; if that read fails, zones get generic names and no source list. After
+setup, losing HTTP costs only zone power, never volume control.
 
-So: **TCP for writes and fast state, HTTP for identity, discovery and group power.**
-
-The HTTP JSON API is undocumented by the vendor — it was found by reading the web UI's own
-JavaScript. That makes it a dependency worth naming honestly: it is not contractual, and a
-firmware update could move it. The integration should degrade rather than fail if it
-disappears, losing group power and device-supplied names but keeping volume control.
-
-There is also an `action=write` form on the same endpoint. This integration does not use it.
-Everything writable is writable over TCP, and the HTTP write path was observed accepting a
-request it did not apply.
+HTTP is read-only by choice. Its `action=write` form applies some fields and not others
+(an `output-group` write reported success without applying), and TCP is where a reply can
+be matched to its request. Read over HTTP and write over TCP, rather than track which
+fields can be trusted.
 
 ## Connection model
 
-Three measured device behaviours, each of which rules out an otherwise reasonable design:
-
-**One TCP session, held for the config entry's lifetime.** With two sockets open
-concurrently, the *first* socket received both replies and the second received nothing. A
-second connection does not merely fail — it silently corrupts the first socket's reply
-stream, which is far worse, because the failure surfaces as wrong values rather than as an
-error. This rules out a connection pool, and it rules out connect-per-command.
-
-**Positional correlation, serialised by a lock.** Replies carry no sequence number and no
-request id. The Nth reply belongs to the Nth command and nothing in the payload can prove
-it — which is another reason a second connection is intolerable.
-
-An earlier draft of this document specified pipelining: push a `Future` per command onto a
-queue, let a reader task resolve the head. The device does pipeline correctly — N queries
-down one socket return N ordered replies — so this works right up until a command gets no
-reply. Then the queue is permanently one ahead of the stream, and *every subsequent reply
-resolves the wrong request*, silently, reporting one zone's volume as another's.
-
-That is not hypothetical here: a group with no channels answers with silence, so the
-no-reply case is a normal part of discovery rather than an error path.
-
-The implementation therefore holds an `asyncio.Lock` across each write-then-read. It costs
-a round trip per command on a poll cycle of a handful of commands, and in exchange a
-timeout is a local event instead of a corrupting one. When a read does time out unexpectedly
-the connection is dropped and reopened, because reconnecting is the only way to be *certain*
-of alignment again.
-
-**Fixed-width reads, never `readline()`.** Replies are exactly 50 bytes, NUL-padded, with
-no terminator. `readexactly(50)` under a timeout; a line-oriented reader waits forever for
-a newline that never comes.
-
-**The group letter is a correlator, and must be checked.** Scoped replies echo their
-`Group:` letter. That single field is the only way to prove a reply belongs to the query
-that asked for it, and checking it is what makes a late reply detectable instead of
-silently authoritative. A group that answers *late* rather than not at all is otherwise
-indistinguishable from the next group answering promptly — one slow zone makes zone A
-disappear and invents a phantom zone C, for the life of the config entry.
-
-The getters raise on a mismatch, so a desync becomes a failed poll and a clean reconnect
-instead of wrong values. Discovery instead discards the stale reply and continues, because
-there the enumeration is cross-checked against the authoritative HTTP channel map anyway,
-and failing setup over a momentarily slow amplifier would be worse than under-reporting a
-zone the cross-check then restores.
-
-`readexactly` does not consume its buffer until it holds all 50 bytes, so a cancelled read
-leaves everything already delivered queued for the next reader. Every exit path from a
-request therefore tears the socket down — including **cancellation from outside**, which
-`asyncio.timeout` does not convert into `TimeoutError` and which Home Assistant raises
-routinely when it cancels a coordinator refresh on reload.
-
-**Shutdown must never be re-entered as a connect.** `disconnect()` is lock-free by necessity,
-since a request calls the teardown from inside the locked region and `asyncio.Lock` is not
-reentrant. That means it can land while another task is suspended in `open_connection`, where
-it sees no writer to close and returns having closed nothing. The connect therefore re-checks
-the closed flag once the socket is up and discards it if so. Without that, the new socket is
-published onto a client already closed for good and nothing ever closes it — which on a device
-with one control session locks out every later setup until Home Assistant restarts.
-
-The sibling Triad AMS integration, built on what appears to be the same OEM platform, has the
-same hole in the same place and reaches it from the other direction: its shutdown path nulls the
-stream first, so the in-flight read fails as a *network* error and its worker dutifully
-reconnects a connection that was just told to stop.
-
-Connection loss is handled by **lazy reconnection**, not a backoff loop inside the client.
-A failed read tears the socket down; the next command reopens it. The retry cadence is
-therefore the coordinator's poll interval, and Home Assistant's own coordinator backoff
-covers repeated failure — a second backoff loop underneath it would only fight with it.
-
-Entity availability follows the coordinator's last update rather than the socket's state.
-Keying it on the socket would mark every zone unavailable for a whole interval over one
-late reply, since a late reply is exactly what tears the socket down.
-
-### A consequence worth stating plainly
-
-Because the amplifier accepts one control session, **this integration and any other
-controller are mutually exclusive.** A Savant, Control4, RTI or Crestron system holding the
-port will break this integration, and vice versa. That is a property of the hardware, not a
-limitation to engineer around, and it belongs in the troubleshooting docs.
+- **One TCP session for the config entry's lifetime.** A second concurrent socket corrupts
+  the first one's reply stream: wrong values, no error. So no pool, no
+  connect-per-command, and no other controller (Savant, Control4, RTI, Crestron) on the
+  same amplifier: that is the hardware.
+- **Serialised by a lock, not pipelined.** Replies carry no request id; the Nth reply
+  belongs to the Nth command. The device pipelines correctly, but a queue of futures falls
+  permanently one behind the first time a command gets no reply, and an empty group
+  answers with silence, so that is routine. The lock costs a round trip per command and
+  makes a timeout local instead of corrupting. An unexpected timeout drops the socket:
+  reconnecting is the only certain realignment.
+- **Fixed 50-byte reads, never `readline()`.** Replies have no terminator.
+- **The group letter is checked.** Scoped replies echo `Group:`, the only proof a reply
+  belongs to its query. Unchecked, one slow group makes zone A vanish and invents a phantom
+  zone C. Getters raise on a mismatch, giving a failed poll and a clean reconnect.
+  Discovery discards the stale reply and carries on instead: the HTTP cross-check restores
+  anything missed, and failing setup over one slow reply would be worse.
+- **A failed or cancelled request tears the socket down**, including cancellation from
+  outside, which `asyncio.timeout` does not convert and which Home Assistant raises when
+  it cancels a refresh on reload. `readexactly` keeps a partial read buffered, and the next
+  command would read it.
+- **Close is final, even mid-connect.** `disconnect()` is lock-free, because a request
+  tears down from inside the lock and `asyncio.Lock` is not reentrant. So it can land while
+  a connect is suspended in `open_connection`, and the connect re-checks the closed flag
+  and discards the new socket. Otherwise that socket is orphaned, and on a one-session
+  device it locks out every later setup until Home Assistant restarts.
+- **Reconnection is lazy.** The next command reopens a torn-down socket, so the retry
+  cadence is the poll interval and the coordinator's backoff covers repeated failure. A
+  second backoff loop would fight it.
+- **Availability follows the coordinator's last update, not the socket.** A late reply
+  tears the socket down, so keying on it would mark every zone unavailable for an
+  interval.
 
 ## Polling, not push
 
-`iot_class` is `local_polling`, and that is now **measured rather than inferred**.
-
-A socket was held open and idle while the volume was changed out of band over HTTP. Twenty
-seconds of silence before the change, twenty after, and then a control query on the same
-socket answered in ten milliseconds — proving the reader worked the whole time and the
-silence belonged to the amplifier. See *Push: tested, and it does not* in
-[`protocol.md`](protocol.md).
-
-The earlier argument here was that three independent third-party drivers all poll, which was
-correctly labelled suggestive rather than proof. It happened to be right, but it is worth
-noting it was the weaker kind of evidence: the sibling Triad device, on the same OEM
-platform, *does* push one class of frame. Converging third-party behaviour is a hint about
-what implementers found necessary, not a statement about the hardware.
-
-One vector is still open — audio sense, which is what Triad's push actually reports. It
-would not change this decision: an audio-sense event says a source woke up, not what the
-volume is.
+`iot_class` is `local_polling` because the amplifier sends nothing unsolicited: tested,
+not inferred (see [`protocol.md`](protocol.md)). The untested vector, audio sense, would
+not change this: it says a source woke up, not what the volume is.
 
 ## Entity model
 
-**One device** — the amplifier, identified by its serial number — with **N entities**, not
-a device per zone. The zones are groups inside a single box with a single serial, a single
-firmware and a single network address; modelling them as separate devices would invent a
-hierarchy the hardware does not have.
+**One device** (the amplifier, keyed by serial) with one entity per zone. Zones are
+groups in one box with one serial, firmware and address; a device per zone would invent a
+hierarchy the hardware lacks.
 
 ### Zone entities
 
-One `media_player` per populated group. Names come from the device: the member channels'
-names with the L/R suffix stripped, so `Patio L` and `Patio R` become **Patio**.
+One `media_player` per populated group, named from the device: member channel names with
+the L/R suffix stripped (`Patio L` + `Patio R` → **Patio**), or `Zone A` without the
+channel map.
 
-Zones are **discovered, not configured**. Query volume on groups `0x00`–`0x07`; an empty
-reply means the group has no channels. Cross-check against the HTTP channel→group map,
-because empty replies are also what a churning connection produces — the enumeration is
-only trustworthy on a settled socket.
-
-Groups can gain and lose channels through the web UI, so this is not a one-time fact.
+Zones are **discovered, not configured**: query volume on groups `0x00`–`0x07`, where
+silence means no channels, then cross-check against the HTTP channel map. The map wins on
+disagreement, because connection churn produces the same empty replies. Discovery runs
+once, at setup; see [Known limitations](#known-limitations).
 
 ### The zone is the player; there is no amp-level entity
 
-An earlier version of this design added an amp-level entity, and then a per-source one,
-both to give Music Assistant a single volume to hold when one streamer feeds several
-zones. Both are dropped. The model now follows how Control4 does room audio: **each zone
-is an independent player**, with its own source, volume, mute and power, and zones that
-share a source share that source's playback the way rooms join a Control4 media session.
+An amp-level entity, then a per-source one, were designed to give Music Assistant one
+volume to hold when a streamer feeds several zones. Both are dropped. As in Control4 room
+audio, **each zone is an independent player** with its own source, volume, mute and power,
+and zones on one source share its playback.
 
-That is all expressible in Home Assistant's standard `media_player`, one entity per zone:
-source selection routes the amp, power switches the zone, mirroring shows the source's
-track, and -- still to build -- transport passes through to the source's player and
-`media_player.join` routes zones onto a common source. There is no second kind of entity
-to explain, and nothing whose "volume" is an average of other volumes.
+That fits the standard `media_player`: source selection routes the amp, power switches the
+zone, and mirroring shows the source's track; transport pass-through and
+`media_player.join` fit the same model ([roadmap](roadmap.md#transport-and-grouping)).
+There is no second kind of entity, and no "volume" averaged from other volumes, which
+[`gain-offset`](protocol.md#http-endpoints) would make meaningless.
 
-The one physical constraint that survives: **playback belongs to the source, not the
-zone.** Zones on the same streamer share one stream, so pausing in one pauses them all.
+The one constraint left: **playback belongs to the source, not the zone.** Pausing one zone
+on a streamer pauses every zone on it.
 
 ### Feature flags, and why they are not cosmetic
 
-```python
-_attr_device_class = MediaPlayerDeviceClass.RECEIVER
-_attr_supported_features = (
-    MediaPlayerEntityFeature.VOLUME_SET
-    | MediaPlayerEntityFeature.VOLUME_STEP
-    | MediaPlayerEntityFeature.VOLUME_MUTE
-    | MediaPlayerEntityFeature.TURN_ON
-    | MediaPlayerEntityFeature.TURN_OFF
-    | MediaPlayerEntityFeature.SELECT_SOURCE
-)
-```
+Device class `RECEIVER`, with `VOLUME_SET`, `VOLUME_STEP`, `VOLUME_MUTE`, `SELECT_SOURCE`,
+`TURN_ON` and `TURN_OFF`. `RECEIVER` and `VOLUME_STEP` are a trade, because HomeKit Bridge
+routes `media_player` by device class:
 
-`RECEIVER` and `VOLUME_STEP` are load-bearing, and the choice is a **trade, not a free
-win**. HomeKit Bridge routes `media_player` by device class:
+| Device class | HomeKit result |
+|---|---|
+| `RECEIVER` | Receiver accessory, the only route with a real volume control. Its speaker service needs `VOLUME_MUTE` or `VOLUME_STEP`; `VOLUME_SET` alone yields nothing. |
+| `SPEAKER` or unset | A mute-only switch with no volume, or nothing at all without `VOLUME_MUTE`. |
 
-- `RECEIVER` routes to the receiver accessory — the only route that carries a real volume
-  characteristic. It builds its speaker service **only if `VOLUME_MUTE` or `VOLUME_STEP` is
-  present**, so `VOLUME_SET` alone yields nothing there.
-- `SPEAKER`, or unset, falls through to feature validation. With `VOLUME_MUTE` declared the
-  entity does bridge — as a mute-only switch accessory with **no volume at all**. It is
-  dropped entirely only when `VOLUME_MUTE` is absent too.
-
-The cost of `RECEIVER`: Home Assistant treats `TV`/`RECEIVER`/`PROJECTOR` as
-**accessory-mode only**, and a HomeKit bridge created through the UI sets
-`exclude_accessory_mode`, so these zones are **silently excluded from it** — no warning.
-Exposing them to HomeKit means a separate HomeKit instance per zone, which is what every
-AVR integration requires and is standard HA behaviour rather than a defect here.
-
-So: `RECEIVER` buys a real volume slider at the price of per-zone pairing; `SPEAKER` buys
-bridging at the price of having no volume, which is the wrong half of the trade for an
-amplifier. Alexa and Assist are satisfied by `VOLUME_SET` alone and are unaffected either
-way. None of this is visible until someone opens the Home app.
+The cost of `RECEIVER`: Home Assistant makes `TV`/`RECEIVER`/`PROJECTOR` accessory-mode
+only, so a bridge created in the UI **silently excludes** these zones. Each needs its own
+HomeKit instance, as every AVR integration does. That buys a volume slider; `SPEAKER`
+would buy bridging with no volume, the wrong half for an amplifier. Alexa and Assist need
+only `VOLUME_SET`.
 
 ### Why not `number` entities for volume
 
-A `number` would give long-term statistics, which `media_player` volume (an attribute)
-does not. It would also lose the media control card, Assist's volume intents, Alexa's
-Speaker interface and HomeKit entirely — `number` is not bridged. The trade is not close.
-
-If volume history matters later, add a `number` at `EntityCategory.DIAGNOSTIC` *alongside*
-the `media_player`, rather than moving the primary control.
+A `number` gains long-term statistics but loses the media control card, Assist's volume
+intents, Alexa's Speaker interface and HomeKit. If volume history matters, add a
+diagnostic `number` alongside the `media_player`.
 
 ## Known limitations
 
-Recorded here rather than left to be rediscovered:
-
-- **Zone names are read once, at setup.** Renaming a zone in the amplifier's web UI does
-  not propagate until the config entry is reloaded, and neither does adding or removing a
-  zone. The channel map is only read during discovery.
-- **Standby with zones flagged on.** Home Assistant only puts the amplifier in standby when
-  every zone is off, so a wake from HA brings back exactly the zone asked for. If standby
-  came from the front-panel button with zones still on, their flags survive it, and the
-  next wake brings every one of them back, not just the zone requested.
-- **Mute and source reply formats are unverified.** Only the volume and amplifier-power
-  literals have been captured from real hardware. The parsers are case-insensitive and log
-  a warning with the raw text when a reply arrives but does not match, so a format surprise
-  becomes a bug report rather than a permanently dead control.
-- **One controller at a time.** See the connection model: this integration and any
-  Savant/Control4/RTI system are mutually exclusive.
+- **The channel map is read once, at setup**: zones, names, sources and the amplifier's
+  own ceilings. A change in the web UI needs a reload.
+- **A wake from outside Home Assistant** brings back every zone whose flag survived
+  standby. A wake from Home Assistant does not; see [Power](#power).
+- **An unexpected reply format** is logged with its raw text rather than dropped, so a
+  firmware difference becomes a bug report rather than a dead control.
 
 ## Volume
 
-The device range is **−70 to +12 dB** in 1 dB steps, `byte = dB + 183`.
+Range and encoding are in [`protocol.md`](protocol.md). Home Assistant's 0–1 maps onto
+−70 dB up to a **ceiling set in the options flow, 0 dB by default**. It is one value for
+every zone, lowered per zone to the amplifier's own
+[`maximum-volumes`](protocol.md#http-endpoints) for that group (flagged by
+`max_volume_db_capped_by_device`).
 
-Home Assistant's 0.0–1.0 maps onto −70 dB up to a **per-zone configurable maximum,
-defaulting to 0 dB**.
++12 dB is not the default: it is the factory turn-on level, and the vendor's integrator
+notes flag it. A slider whose right end is maximum gain will eventually be dragged there
+by a phone in a pocket. Raising the ceiling is a deliberate act.
 
-The +12 dB ceiling is deliberately not the default. It is the factory turn-on level, and
-the vendor's own integrator notes single it out as something to change before commissioning.
-A volume slider whose right-hand end is maximum gain is a slider that will eventually be
-dragged there by a phone in a pocket. Raising the ceiling stays possible, but as a conscious
-act in the options flow.
-
-`_attr_volume_step` is derived from the configured range so `volume_up` / `volume_down`
-move exactly one device step rather than Home Assistant's default 10%.
+Volume up and down move one device step (1 dB), not Home Assistant's default 10%.
 
 ## Power
 
-Home Assistant owns power. The amplifier's Auto On method is **Power Button** with every
-channel's sleep set to **OFF**, so nothing on the amplifier changes power by itself --
-which is the point. In `Audio` mode it wakes a zone the moment the source plays, and a
-zone accidentally unmuted at 2am plays into the garden.
+Home Assistant owns power. The amplifier's Auto On method must be **Power Button** with
+every channel's sleep **OFF**, so nothing changes power by itself. In `Audio` mode a zone
+wakes the moment its source plays, and a zone unmuted by accident at 2am plays into the
+garden.
 
-Every rule below is measured behaviour; see *Power* in [`protocol.md`](protocol.md).
+The rules rest on [Power: measured in Power Button mode](protocol.md#power-measured-in-power-button-mode),
+including what was not measured.
 
-- **A zone is on only when the amplifier is on AND the zone is on.** Zone flags survive
-  standby, so either signal alone lies. When either is unknown the state is *unknown*, not
-  `on` -- a switched-off zone still answers volume and mute queries, so answering proves
-  nothing -- and an unknown zone does not mirror its source's track either.
-- **One missed read does not make a zone unknown.** HomeKit shows `unknown` as off, and
-  `media_player.toggle` answers `unknown` by switching the zone *off*. So the last zone
-  power read from the status page is kept for five minutes after the page stops answering
-  (or three poll intervals, if longer), and an "on" answer for the amplifier across up to
-  two unanswered queries. A "standby" answer is *not* carried: if the amp was woken from
-  outside Home Assistant meanwhile, carrying it would show zones OFF while they play.
-  A status page that answers with an empty or malformed body counts as not answering: an
-  empty map reads as "no zone is on", and acting on that would put the amp in standby
-  under zones that are playing.
-- **Turning a zone on restores its mute, and checks it stuck.** Switching a zone on
-  clears its mute. The mute is read from the amplifier while the zone is still off -- it
-  keeps it -- and sent straight after the zone-on, the two frames under one hold of the
-  protocol lock so nothing can queue between them. Whether a mute sent that soon survives
-  the clear is unmeasured, so it is read back at 0.3, 0.6, 1.0 and 1.5 s -- to 5 s straight
-  after a wake, when a zone may power up late -- and anything but a confirmed "muted",
-  including no answer, is met with another mute. It must end on a confirmed read or the
-  switch-on counts as failed (below). If the read before switching on fails, the last
-  polled value is used; if there is none, the zone comes on muted. A zone someone muted
-  stays muted until someone unmutes it.
-- **A switch-on that breaks part-way leaves the zone silent.** If any step after the
-  zone-on fails -- an echo that never arrives, a mute that cannot be confirmed -- the zone
-  is muted again and that is checked the same way; if it still cannot be confirmed the zone
-  is switched off, and muted once more while off. The mute is then *owed*: the next
-  switch-on restores it whatever the amplifier reports, until a restore is confirmed or
-  someone sets the mute themselves. What is shown afterwards is what the status page says,
-  and the mute as unknown when it is. The error is still raised. A zone-on that never left
-  -- no connection to send it on -- is the one failure that proves nothing happened, and it
-  changes nothing. A caller cancelled before anything was switched cancels the request;
-  one cancelled after the zone-on does not stop it, and if it then fails, the log says so.
-- **Turning on a zone that is already on does nothing.** Scenes and
-  `homeassistant.turn_on` call `turn_on` without checking, and whether a zone-on resets a
-  playing zone to its turn-on volume is unmeasured. It is judged from a fresh amplifier
-  read plus the status page, or the last known zone power when the page is down.
-- **Unknown is not guessed.** If the amplifier's own power cannot be read after three
-  tries, nothing is switched: a power-on to an amp already on was never measured. If the
-  amp is on but the zone's power is unknown -- status page down past the carry-forward
-  bound -- the zone is not switched on either: it may be playing, and a zone-on may reset
-  its volume. *This one is a choice, not a necessity.* It blocks turning zones on during a
-  long status-page outage; the alternative is to send the zone-on and accept the unmeasured
-  risk. Measuring a zone-on to a zone already on would settle it.
-- **Waking brings back only the zone asked for.** A wake revives every zone whose flag
-  survived standby -- every zone that was on when something other than Home Assistant
-  put the amp to sleep. They are all shown off while it sleeps, so turning one on must not
-  bring back three: flagged zones, the requested one included, are switched off before the
-  wake and again after it, whatever standby appeared to say. The requested zone's zone-on
-  is then always the measured off-to-on case, which applies its turn-on volume. If standby
-  does not answer a zone-off at all, the rest wait for the wake rather than each waiting
-  out a timeout. A power-on whose echo is lost is waited on anyway, so the clean-up still
-  runs. A revived zone that cannot be switched off is shown as on (or unknown), never off,
-  and the error is raised.
-- **Waking waits for the boot, and so does everything else.** From standby, turn-on sends
-  power-on and then nothing but status queries until the amplifier reports `On` (~10 s).
-  Every write holds the coordinator's command lock for its whole duration, and a power
-  change holds it throughout -- `PARALLEL_UPDATES` alone is not enough, because Assist's
-  relative-volume intent calls entity methods directly. Volume up and down read the
-  current level from the amplifier inside the lock, so a step that waited starts from the
-  turn-on volume, and a stale cache never turns a step into a jump; without a reading, a
-  step up past the ceiling is refused. Assist's *percentage* step computes its target from
-  `volume_level` before it reaches the lock, so a zone that is off -- or whose level has not
-  been read since it was switched on -- reports no `volume_level`, and HA's handler fails
-  with an error instead of jumping. Several zones switched on together share one wake. A
-  wake that times out is not retried for a minute, or until a poll finds the amplifier on,
-  and the holdoff is checked before anything is sent.
-- **The status page is not waited on twice.** Inside a power change each read is bounded
-  at three seconds -- it answers in well under a tenth of one -- and after one failure the
-  rest of that change does without it.
-- **Polls do not overwrite what a command just set.** A poll does not start while a
-  command holds the lock, and one already reading when a change lands discards its own
-  results, which predate it. A skipped poll after a failed one still counts as failed.
-- **One blip does not make a zone ignore turn_off.** Home Assistant silently skips an
-  unavailable entity in a service call, so a poll whose reads fail asks again on a fresh
-  connection before calling the amplifier unreachable, and after an outright failure the
-  next poll comes in five seconds rather than a whole interval.
-- **The last zone off puts the amplifier in standby.** It does not do this itself. A
-  zone-off that gets no answer is checked on the status page -- it may have landed -- and
-  sent once more. Standby is sent whatever the cached state says, since the cache can be
-  stale. When the status page is unreachable there is no knowing whether another zone is
-  still on, so the amplifier is left alone rather than risk silencing it. Turning off a
-  zone in a sleeping amplifier is best effort -- it is already silent -- and what is shown
-  is what the status page then says, or unknown without it.
-- **Power and mute writes are acknowledged by their own echo.** Each is checked against
-  the command and the group it was for, as recorded from the device; a frame of padding or
-  another group's reply is a desync, not an acknowledgement. With the status page down the
-  echo is the only confirmation there is.
-- **Power changes are confirmed on the status page** and the command is retried once.
-- **Unload waits for a power change in progress**, up to the wake timeout plus fifteen
-  seconds, and refuses anything queued behind it. Cutting one off mid-wake would leave the
-  zones the wake revived playing.
-- **Switching on applies the zone's turn-on volume**, a fixed level or `LAST` depending on
-  how the zone is set up. The volume is read back afterwards, asking twice.
+- **A zone is on only when the amplifier and the zone are both on.** Zone flags survive
+  standby, so either alone lies. Off if either reads off, else unknown if either is
+  unknown, never `on`: a switched-off zone still answers queries. An unknown zone does not
+  mirror its source's track.
+- **One missed read does not make a zone unknown.** HomeKit shows unknown as off, and
+  `media_player.toggle` answers unknown by switching the zone *off*. So zone power from
+  the status page is kept for five minutes (or three poll intervals, if longer), and an
+  amplifier "on" across up to two unanswered queries. "Standby" is never carried: if something
+  else woke the amp, zones would show off while playing. An empty or malformed status page
+  counts as no answer; an empty map reads as "every zone off", and would put the amp in
+  standby under playing zones.
+- **Switching on restores the mute, and checks it stuck.** A zone-on clears the mute. The
+  mute is read while the zone is off (it keeps it there) and sent straight after the
+  zone-on, both frames under one hold of the protocol lock. Whether a mute that early
+  survives the clear is unmeasured, so it is read back at 0.3, 0.6, 1.0 and 1.5 s (to 5 s
+  after a wake, when a zone may power up late) and re-sent on anything but a confirmed
+  "muted", including no answer. Without a confirmed read the switch-on has failed. If the
+  pre-read fails, the last polled value is used; with none, the zone comes on muted.
+- **A muted zone's switch-on that breaks part-way leaves it silent.** If a step after the
+  zone-on fails (a lost echo, an unconfirmed mute), the zone is muted and checked again;
+  failing that, switched off and muted once more while off. The mute is then *owed*: the
+  next switch-on restores it whatever the amplifier reports, until a restore is confirmed
+  or someone sets the mute. The status page decides the power shown, an unconfirmed mute
+  shows unknown, and the error is still raised. A zone-on that never left (no connection)
+  is the one failure that proves nothing happened, so it changes nothing. A caller
+  cancelled before the zone-on cancels the request; after it, the sequence finishes and any
+  failure is logged.
+- **A zone that is already on is left alone.** Scenes and `homeassistant.turn_on` call
+  `turn_on` without checking, and whether a zone-on resets a playing zone's volume is
+  unmeasured. Judged from a fresh amplifier read and the status page, or the last known
+  zone power when the page is down.
+- **Unknown is not guessed.** If amplifier power is unreadable after three tries, nothing
+  is switched: power-on to an amp already on was never measured. If the amp is on but the
+  zone's power is unknown (the page down past the carry-forward bound), the zone is not
+  switched on: it may be playing. *This one is a choice:* it blocks turn-on during a long
+  page outage, and measuring a zone-on to a zone already on would settle it.
+- **Waking brings back only the zone asked for.** A wake revives every zone that was on
+  when something else put the amp to sleep, and all of them show off while it sleeps. So
+  flagged zones, the requested one included, are switched off before the wake and again
+  after it, whatever standby appeared to say (every zone, without the status page). The
+  requested zone's zone-on is then always the measured off-to-on case, which applies its
+  turn-on volume. If standby does not answer a zone-off, the rest wait for the wake rather
+  than each timing out. A power-on with a lost echo is waited on anyway, so the clean-up
+  runs. A revived zone that cannot be switched off shows on or unknown, never off, and the
+  error is raised.
+- **Everything waits for the boot.** From standby, turn-on sends power-on, then only status
+  queries until the amplifier reports `On` (~10 s). Every write holds the coordinator's
+  command lock, and a power change holds it throughout. `PARALLEL_UPDATES` is not enough,
+  because Assist's relative-volume intent calls entity methods directly. Zones switched on
+  together share one wake.
+- **Volume steps start from a fresh read.** Up and down read the level inside the lock, so
+  a step after a wake starts from the turn-on volume and a stale cache never turns a step
+  into a jump. Without a reading the device's own step is sent, except upward when the last
+  known level is already at the ceiling. Assist's percentage step works from `volume_level`
+  before it reaches the lock, so a zone that is off, or unread since it was switched on,
+  reports none and Home Assistant's handler errors instead of jumping.
+- **A wake that times out is not retried for a minute**, or until a poll finds the amplifier on;
+  the holdoff is checked before any write. Otherwise a scene switching four zones on
+  against an amp that will not wake spends four timeouts, over a minute and a half, with
+  every command queued behind them.
+- **The status page is not waited on twice.** Inside a power change each read is bounded at
+  three seconds (it answers in under a tenth of one), and after one failure the rest of the
+  change does without it.
+- **Polls do not overwrite what a command just set.** A poll does not start while a command
+  holds the lock, and one already reading when a change lands discards its results. A
+  skipped poll after a failed one still counts as failed.
+- **One blip does not make a zone ignore `turn_off`.** Home Assistant silently skips an
+  unavailable entity in a service call, so a failed poll asks again on a fresh connection
+  before calling the amplifier unreachable, and the next poll after a failure comes in five
+  seconds.
+- **The last zone off puts the amplifier in standby**, which it does not do by itself. An
+  unanswered zone-off is checked on the status page (it may have landed) and sent once
+  more. Standby is sent whatever the cache says, since the cache can be stale. Without the
+  status page another zone may still be on, so the amplifier is left alone. Turning off a
+  zone in a sleeping amplifier is best effort; the status page decides what is shown, or
+  unknown without it.
+- **Power and mute writes are acknowledged by their own echo**, checked for command and
+  group. Padding or another group's reply is a desync, not an acknowledgement. With the
+  status page down, the echo is the only confirmation.
+- **Power changes are confirmed on the status page**, and the command is retried once.
+- **Unload waits for a power change in progress**, up to the wake timeout plus 15 s, and
+  refuses anything queued. Cutting a wake off leaves the zones it revived playing.
+- **Switching on applies the zone's turn-on volume**, fixed or `LAST`, so the volume is
+  read back, asking twice.
 
 Known limits, each needing an unmeasured behaviour or an unlikely combination:
 
-- **Scene order matters for latency.** A scene that switches zone B off before zone A on,
-  with B the last zone playing, puts the amplifier in standby and then wakes it (~10 s).
-  The end state is right. List the zones being switched on first.
+- **Scene order affects latency.** Switching zone B, the last one playing, off before zone
+  A on puts the amplifier in standby and then wakes it (~10 s). The end state is right.
+  List the zones being switched on first.
 - **A wake that fails part-way** skips the post-wake zone-offs. If standby also ignored the
-  pre-wake ones and the boot then completes late, revived zones play. The error is raised,
+  pre-wake ones and the boot then completes late, revived zones play. The error is raised
   and the next poll shows them on.
 - **Home Assistant stopping mid-wake** is not waited for: stopping does not unload
-  integrations. Unload and reload are.
-- **Nothing checks the premise.** Home Assistant owning power depends on the amplifier's
-  Auto On method being Power Button with sleep off, and the integration does not read that
-  setting. See the roadmap.
+  integrations. Unload and reload do.
+- **Nothing checks the premise.** The integration does not read the Auto On setting. See
+  the [roadmap](roadmap.md).
 
 ## Forbidden operations
 
 **Opcodes `0x21`–`0x28` reassign channels between groups. The integration must never send
-them.**
+them, and no service may surface them.**
 
-They are destructive, there is no safe inverse without a prior settings backup, and — the
-part that makes them genuinely dangerous — **the echo lies.** An assignment returned
-`Channel <name> group is B` for a change that was never applied; the authoritative HTTP
-map still read the old value afterwards. The vendor's own HTTP write endpoint failed the
-same way, also reporting success.
+They are destructive, have no safe inverse without a prior settings backup, and **the echo
+lies**: it reports success for an assignment that never applied
+([evidence](protocol.md#forbidden-channelgroup-assignment)). The frame builder refuses
+everything in `FORBIDDEN_OPCODES` rather than leaving it to convention, because a mistake
+here is invisible where it is made.
 
-This is enforced in the frame builder against `FORBIDDEN_OPCODES`, not left to convention,
-precisely because a mistake here is invisible at the point of the mistake.
-
-The general lesson is worth carrying beyond these opcodes: **this device's echo is not
-confirmation.** Read back through HTTP before believing a configuration change.
-
-Group topology belongs in the amplifier's web UI.
+The wider rule: **this device's echo does not confirm a configuration change; read it back
+over HTTP.** Group topology belongs in the amplifier's web UI.
 
 ## Error handling
 
-Every write is wrapped so protocol errors surface as translated `HomeAssistantError`
-rather than raw exceptions, naming the entity and the operation.
-
-Connection loss logs once at `info` on the way down and once on the way back up — not on
-every failed poll. A device that is off overnight should not produce hundreds of log lines.
-
-Setup failure raises `ConfigEntryNotReady` so Home Assistant retries with backoff, rather
-than returning `False` and requiring manual intervention.
+- Writes surface protocol errors as translated `HomeAssistantError`s naming the entity and
+  the operation, not raw socket errors.
+- Connection loss is logged once going down and once coming back, not on every failed
+  poll. An amplifier unreachable overnight should not produce hundreds of log lines.
+- Setup failure raises `ConfigEntryNotReady`, so Home Assistant retries with backoff. That
+  includes finding no zones, which an amplifier not yet answering also produces.
 
 ## Identity
 
-The config entry's `unique_id` is the amplifier's **serial number**, read over HTTP.
-
-These amplifiers are commonly on DHCP, so the IP address is not identity — and Home
-Assistant's own rules disallow IP, hostname and device name as unique-id sources for exactly
-this reason. Keying on the serial means a DHCP move requires reconfiguring the host, not
-rebuilding the entry and losing entity history.
+The config entry's `unique_id` is the amplifier's **serial number**, read over HTTP. These
+amplifiers are commonly on DHCP, and Home Assistant disallows IP, hostname and device name
+as unique ids for exactly that reason. Adding the amplifier again at a new address updates the existing
+entry's host and keeps entity history.
 
 ## Testing
 
-The device is awkward to test against: single-session, no NAK format, and a protocol whose
-replies are positional. Three tiers:
+The device is single-session, has no NAK and matches replies by position, so no test
+touches it:
 
-1. **Fake client object** — most entity tests. Patch at a factory seam in `protocol.py`.
-2. **Fake transport under the real client** — patch `asyncio.open_connection` with a reader
-   pre-fed canned 50-byte frames. This is where framing, FIFO correlation and reconnect get
-   tested.
-3. **Loopback protocol emulator** — `asyncio.start_server` running a small state machine.
-   Best value for reply-format edge cases.
+| Layer | Fake | Where |
+|---|---|---|
+| Protocol client | The real client over a patched `asyncio.open_connection` with scripted 50-byte replies | `test_protocol.py` |
+| Power | The real coordinator over `FakeAmp`, which encodes the measured power behaviour and can be told to misbehave | `test_power.py` |
+| Entities, HTTP, config flow | Mocked client, coordinator or HTTP session | `test_media_player.py`, `test_http_api.py`, `test_config_flow.py` |
 
-Cases that exist because this specific device bites there:
-
-- 50-byte NUL-padded reply, trailing NULs stripped
-- **both** reply forms — `Vol=-27db` (command echo) and `Vol=-27 db` (query)
-- dB↔byte round-trip across the full −70…+12 range
-- zone enumeration where some groups return nothing
-- a read that times out rather than returning 50 bytes
-- the frame builder refusing every opcode in `FORBIDDEN_OPCODES`
+Cases that exist because this device bites there: NUL-padded replies, **both** volume reply
+forms (`Vol=-27db` echo, `Vol=-27 db` query), the dB↔byte round-trip over −70…+12, groups
+that return nothing, reads that time out, and the frame builder refusing every forbidden
+opcode.
 
 ## Distribution
 
-A HACS custom repository. The protocol client is **bundled** in `protocol.py` rather than
-published to PyPI — appropriate for a single-target integration, and revisitable if this
-ever heads toward Home Assistant core, where `dependency-transparency` would require a
-published library.
+A HACS custom repository. The protocol client is bundled in `protocol.py`, not published to
+PyPI: right for one target, and revisitable if this heads for Home Assistant core, where
+`dependency-transparency` requires a published library.
 
-`manifest.json` carries no `quality_scale` key. Claiming a tier before meeting it would be
-a false claim; [`quality_scale.yaml`](../custom_components/sonance_dsp/quality_scale.yaml)
-records the target and the exemptions that already apply.
+`manifest.json` claims no `quality_scale` tier until one is met;
+[`quality_scale.yaml`](../custom_components/sonance_dsp/quality_scale.yaml) records the
+target and the exemptions that already apply.
