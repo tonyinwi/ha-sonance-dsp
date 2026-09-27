@@ -261,6 +261,17 @@ class FakeAmp:
         if self._ignored(entry):
             return
         self.volume[group] = db
+        self.mute[group] = False  # measured: ANY volume change un-mutes
+
+    async def volume_up(self, group: int) -> None:
+        self._tick(f"vol{group}:up")
+        self.volume[group] = min(12, self.volume[group] + 1)
+        self.mute[group] = False
+
+    async def volume_down(self, group: int) -> None:
+        self._tick(f"vol{group}:down")
+        self.volume[group] = max(-70, self.volume[group] - 1)
+        self.mute[group] = False
 
     async def set_source(self, group: int, source: int) -> None:
         entry = f"src{group}:{source}"
@@ -327,6 +338,7 @@ def make(hass: HomeAssistant, amp: FakeAmp) -> SonanceCoordinator:
     client = MagicMock()
     for name in ("get_amp_power", "set_amp_power", "set_group_power",
                  "set_group_power_muted", "set_mute", "set_volume", "set_source",
+                 "volume_up", "volume_down",
                  "get_mute", "get_volume", "read_group", "disconnect"):
         setattr(client, name, getattr(amp, name))
     c = SonanceCoordinator(hass, entry, client, IDENTITY, "192.0.2.10")
@@ -2099,9 +2111,10 @@ async def test_a_failed_switch_on_without_the_page_shows_the_zone_unknown(
 # ---------------------------------------------------------------------------
 
 
-async def test_a_silent_power_up_ends_at_the_level_the_zone_had(
+async def test_a_muted_zone_switched_on_stays_silent_and_holds_its_level(
     hass: HomeAssistant,
 ) -> None:
+    """The incident of 2026-09-27: a restore would have un-muted it."""
     amp = FakeAmp()
     amp.turn_on_volume = -70
     amp.group_power[0] = False
@@ -2112,9 +2125,11 @@ async def test_a_silent_power_up_ends_at_the_level_the_zone_had(
     await c.async_turn_on(0, ceiling_db=0)
     amp.settle()
 
-    assert amp.volume[0] == -35
     assert amp.mute[0] is True
-    assert c.data.groups[0].volume_db == -35
+    assert amp.volume[0] == -70
+    assert not any(e.startswith("vol0:") for e in amp.log)
+    assert c.data.groups[0].volume_db == -35  # shown: the level it will have
+    assert c.held_level(0) == -35
 
 
 async def test_the_level_comes_from_the_amp_not_the_cache(hass: HomeAssistant) -> None:
@@ -2273,14 +2288,29 @@ async def test_a_wake_also_restores_the_level(hass: HomeAssistant) -> None:
     for g in amp.group_power:
         amp.group_power[g] = False
     amp.volume[0] = -35
-    amp.mute[0] = True
     c = make(hass, amp)
 
     await c.async_turn_on(0, ceiling_db=0)
     amp.settle()
 
     assert amp.volume[0] == -35
+    assert amp.mute[0] is False
+
+
+async def test_a_wake_holds_a_muted_zones_level(hass: HomeAssistant) -> None:
+    amp = FakeAmp(master=False)
+    amp.turn_on_volume = -70
+    for g in amp.group_power:
+        amp.group_power[g] = False
+    amp.volume[0] = -35
+    amp.mute[0] = True
+    c = make(hass, amp)
+
+    await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
+
     assert amp.mute[0] is True
+    assert c.held_level(0) == -35
 
 
 async def test_a_zone_already_on_is_not_restored(hass: HomeAssistant) -> None:
@@ -2365,3 +2395,155 @@ async def test_the_power_up_wait_is_real(
     await SonanceCoordinator._async_wait_for_power_up(c)
 
     assert loop.time() - start >= 0.05
+
+
+
+# ---------------------------------------------------------------------------
+# A volume change un-mutes a zone (measured 2026-09-27), so a muted zone is
+# never sent one: its level is held, shown, and applied when it is unmuted.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_volume_set_on_a_muted_zone_is_held_not_sent(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp()
+    amp.mute[0] = True
+    c = make(hass, amp)
+    z = zone(c, hass)
+
+    await z.async_set_volume_level(0.5)  # -35 dB
+
+    assert amp.mute[0] is True
+    assert not any(e.startswith("vol0:") for e in amp.log)
+    assert c.held_level(0) == -35
+    assert c.data.groups[0].volume_db == -35
+    assert c.data.groups[0].muted is True
+
+
+async def test_a_volume_set_on_an_unmuted_zone_is_sent(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    c = make(hass, amp)
+    z = zone(c, hass)
+
+    await z.async_set_volume_level(0.5)
+
+    assert amp.volume[0] == -35
+    assert c.held_level(0) is None
+
+
+async def test_a_volume_set_whose_mute_cannot_be_read_is_held(
+    hass: HomeAssistant,
+) -> None:
+    """Unknown is treated as muted: silent is one tap to fix."""
+    amp = FakeAmp()
+    c = make(hass, amp)
+    amp.unanswered_mute = 1
+    z = zone(c, hass)
+
+    await z.async_set_volume_level(0.5)
+
+    assert not any(e.startswith("vol0:") for e in amp.log)
+    assert c.held_level(0) == -35
+
+
+@pytest.mark.parametrize("delta", [+1, -1])
+async def test_a_volume_step_on_a_muted_zone_moves_the_held_level(
+    hass: HomeAssistant, delta: int
+) -> None:
+    amp = FakeAmp()
+    amp.mute[0] = True
+    c = make(hass, amp)
+    c._held_level[0] = -35
+    z = zone(c, hass)
+
+    await (z.async_volume_up() if delta > 0 else z.async_volume_down())
+
+    assert amp.mute[0] is True
+    assert not any(e.startswith("vol0:") for e in amp.log)
+    assert c.held_level(0) == -35 + delta
+
+
+async def test_a_volume_step_on_a_muted_zone_without_a_hold_starts_from_the_amp(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp()
+    amp.mute[0] = True
+    amp.volume[0] = -40
+    c = make(hass, amp)
+    z = zone(c, hass)
+
+    await z.async_volume_up()
+
+    assert amp.mute[0] is True
+    assert c.held_level(0) == -39
+
+
+async def test_unmuting_applies_the_held_level(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    amp.turn_on_volume = -70
+    amp.group_power[0] = False
+    amp.volume[0] = -35
+    amp.mute[0] = True
+    c = make(hass, amp)
+    await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
+    z = zone(c, hass)
+
+    await z.async_mute_volume(False)
+
+    assert amp.mute[0] is False
+    assert amp.volume[0] == -35
+    assert amp.log.index("vol0:-35") < amp.log.index("mute0:off")
+    assert c.held_level(0) is None
+    assert c.data.groups[0].volume_db == -35
+
+
+async def test_unmuting_without_a_hold_only_unmutes(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    amp.mute[0] = True
+    c = make(hass, amp)
+    z = zone(c, hass)
+
+    await z.async_mute_volume(False)
+
+    assert amp.mute[0] is False
+    assert not any(e.startswith("vol0:") for e in amp.log)
+
+
+async def test_muting_keeps_a_held_level(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    amp.mute[0] = True
+    c = make(hass, amp)
+    c._held_level[0] = -35
+    z = zone(c, hass)
+
+    await z.async_mute_volume(True)
+
+    assert c.held_level(0) == -35
+
+
+async def test_a_poll_shows_the_held_level_while_muted(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    amp.mute[0] = True
+    amp.volume[0] = -70
+    c = make(hass, amp)
+    c._held_level[0] = -35
+
+    c.data = await c._async_update_data()
+
+    assert c.data.groups[0].volume_db == -35
+    assert c.held_level(0) == -35
+
+
+async def test_a_zone_unmuted_outside_ha_drops_its_hold(hass: HomeAssistant) -> None:
+    """The amp's level is the truth once it is playing."""
+    amp = FakeAmp()
+    amp.volume[0] = -70
+    c = make(hass, amp)
+    c._held_level[0] = -35
+
+    c.data = await c._async_update_data()
+
+    assert c.held_level(0) is None
+    assert c.data.groups[0].volume_db == -70

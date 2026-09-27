@@ -417,8 +417,7 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
     async def async_set_volume_level(self, volume: float) -> None:
         db = self._to_db(volume)
         async with self.coordinator.command_lock:
-            await self.coordinator.client.set_volume(self._group, db)
-            self.coordinator.apply_optimistic(self._group, volume_db=db)
+            await self.coordinator.async_write_volume(self._group, db)
 
     @command
     async def async_volume_up(self) -> None:
@@ -429,45 +428,13 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
         await self._step(-1)
 
     async def _step(self, delta: int) -> None:
-        """Move one device dB, respecting the configured ceiling and floor.
-
-        Uses an absolute set when the current level is known, so the ceiling is
-        enforced by the same mapping as the slider. Falls back to the device's
-        own relative command when it is not -- better a step against an unknown
-        baseline than no response to a button press.
-
-        The baseline is read from the amplifier, inside the lock, not taken
-        from the cache. A cached level can be stale -- a switch-on applies the
-        zone's turn-on volume, and one late reply to its read-back leaves the
-        old level cached -- and a step computed from a stale level is not a
-        step but a jump, as far as the stale level is from the real one.
-        """
+        """Move one device dB, respecting the configured ceiling and floor."""
         async with self.coordinator.command_lock:
-            client = self.coordinator.client
-            current = await client.get_volume(self._group)
-            if current is None:
-                if delta < 0:
-                    await client.volume_down(self._group)
-                    return
-                # Up against an unread level: the device's own step, unless the
-                # last known level is already at the ceiling it would cross.
-                state = self._state
-                if (
-                    state is not None
-                    and state.volume_db is not None
-                    and state.volume_db >= self._effective_max_db
-                ):
-                    return
-                await client.volume_up(self._group)
-                return
-            target = max(MIN_VOLUME_DB, min(self._effective_max_db, current + delta))
-            if target != current:
-                await client.set_volume(self._group, target)
-            self.coordinator.apply_optimistic(self._group, volume_db=target)
+            await self.coordinator.async_step_volume(
+                self._group, delta, self._effective_max_db
+            )
 
     @command
     async def async_mute_volume(self, mute: bool) -> None:
         async with self.coordinator.command_lock:
-            await self.coordinator.client.set_mute(self._group, mute)
-            self.coordinator.note_user_mute(self._group)
-            self.coordinator.apply_optimistic(self._group, muted=mute)
+            await self.coordinator.async_set_mute(self._group, mute)

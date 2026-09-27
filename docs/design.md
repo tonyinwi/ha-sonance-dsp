@@ -181,7 +181,15 @@ including what was not measured.
   volume is set to −70 dB on the amp, and once the window has passed the level the zone
   had while off is put back, capped at the ceiling and checked by read-back. That level is
   read from the amp (an off zone reports it), so it survives a restart. A restore that
-  fails leaves the zone on at −70, and says so.
+  fails leaves the zone on at −70, and says so. **A muted zone is not restored**: any
+  volume change un-mutes a zone on this amp, so its level is held instead (below).
+- **A muted zone is never sent a volume.** Any volume change un-mutes a zone, even an off
+  one ([protocol](protocol.md#power-measured-in-power-button-mode)), so while a zone is
+  muted -- or its mute cannot be read -- volume changes from HA are held and shown, not
+  sent, and unmuting applies the held level: the volume set is itself the unmute. A zone
+  switched on muted keeps its silent turn-on level with its own level held. A zone
+  un-muted outside HA drops its hold; the amp's level is then the truth. Holds are in
+  memory, so a restart loses them and the zone keeps the level the amp reports.
 - **Switching on restores the mute, and checks it stuck.** The mute is read while the zone
   is off (it keeps it there) and sent straight after the zone-on, both frames under one
   hold of the protocol lock. It is read back at 0.3, 0.6, 1.0 and 1.5 s (to 5 s after a
