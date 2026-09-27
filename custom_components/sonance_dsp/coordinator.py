@@ -147,6 +147,11 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         self._mute_owed: set[int] = set()
         # Zones whose cached volume may predate their last switch-on.
         self._volume_unverified: set[int] = set()
+        # The level each muted zone should have, held rather than sent: ANY
+        # volume change un-mutes a zone on this amplifier, even an off one
+        # (measured 2026-09-27). Applied when the zone is unmuted -- which is
+        # itself done by setting it -- and shown meanwhile.
+        self._held_level: dict[int, int] = {}
 
     async def async_discover(self) -> None:
         """Enumerate populated groups and read the channel layout.
@@ -311,6 +316,12 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         self._volume_unverified -= {
             g for g, state in groups.items() if state.volume_db is not None
         }
+        for group in list(self._held_level):
+            state = groups.get(group)
+            if state is None or state.volume_db is None:
+                continue  # not answered: stays not answered
+            shown = self._shown_level(group, state.volume_db, state.muted)
+            groups[group] = replace(state, volume_db=shown)
         return SonanceData(
             identity=self.identity,
             topology=self._topology,
@@ -437,13 +448,15 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                     # Already on. Scenes and homeassistant.turn_on call this
                     # without checking, and a zone-on to a playing zone may
                     # reset it to its turn-on volume. Refresh and leave it.
+                    volume = await self._async_read_volume(group)
+                    muted = await self.client.get_mute(group)
                     self._apply_power(
                         group,
                         zone_on=True,
                         amp_on=True,
                         power=flags,
-                        volume_db=await self._async_read_volume(group),
-                        muted=await self.client.get_mute(group),
+                        volume_db=self._shown_level(group, volume, muted),
+                        muted=muted,
                     )
                     return
                 if zone is None:
@@ -478,6 +491,14 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                     return
 
             restore = self._mute_to_restore(group, await self.client.get_mute(group))
+            held = self._held_level.get(group)
+            if not restore:
+                self._held_level.pop(group, None)
+            elif held is not None:
+                # Held while off: the amp's own level may be the silent turn-on
+                # volume from an earlier muted switch-on, or older than a level
+                # set since. The hold is what the zone should have.
+                level = max(MIN_VOLUME_DB, min(held, ceiling_db))
             if op.abandoned:
                 return
             await self._async_switch_on(
@@ -533,13 +554,13 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                 await self._async_verify_mute(group, after_wake=after_wake)
         except SonanceNotSentError:
             if sent:
-                await self._async_fail_safe(group, restore, op, known_off)
+                await self._async_fail_safe(group, restore, op, known_off, level)
             else:
                 # Nothing reached the amplifier: the zone is as it was.
                 self._publish_power(known_off, amp_on=True)
             raise
         except SonanceError:
-            await self._async_fail_safe(group, restore, op, known_off)
+            await self._async_fail_safe(group, restore, op, known_off, level)
             raise
 
         if power is None:
@@ -550,11 +571,21 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                 power[other] = False
         if restore:
             self._mute_owed.discard(group)
+        if restore:
+            # Muted: leave it at the silent turn-on level and hold its own. A
+            # volume sent now would un-mute it.
+            self._apply_power(group, zone_on=True, amp_on=True, power=power, muted=True)
+            if level is not None:
+                self._held_level[group] = level
+                self.apply_optimistic(group, volume_db=level)
+            else:
+                self._volume_unverified.add(group)
+            return
         # On now, before the restore makes it audible, with the volume marked
         # unverified until the restore has read it back.
         self._volume_unverified.add(group)
-        self._apply_power(group, zone_on=True, amp_on=True, power=power, muted=restore)
-        volume = await self._async_restore_level(group, level, waited=restore)
+        self._apply_power(group, zone_on=True, amp_on=True, power=power, muted=False)
+        volume = await self._async_restore_level(group, level, waited=False)
         if volume is not None:
             self.apply_optimistic(group, volume_db=volume)
 
@@ -611,6 +642,13 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
             # after a check that had already passed.
             for delay in VOLUME_CONFIRM_DELAYS:
                 if await self.client.get_volume(group) != level:
+                    muted = await self.client.get_mute(group)
+                    if muted is not False:
+                        # Muted meanwhile, from outside Home Assistant: a volume
+                        # sent now would un-mute it. Hold it instead.
+                        self._held_level[group] = level
+                        self.apply_optimistic(group, muted=muted)
+                        return level
                     await self.client.set_volume(group, level)
                 await asyncio.sleep(delay)
                 current = await self.client.get_volume(group)
@@ -631,13 +669,23 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         return await self._async_read_volume(group)
 
     async def _async_fail_safe(
-        self, group: int, restore: bool, op: _PowerOp, known_off: set[int]
+        self,
+        group: int,
+        restore: bool,
+        op: _PowerOp,
+        known_off: set[int],
+        level: int | None,
     ) -> None:
         """After a switch-on broke part-way: leave the zone silent, say so honestly."""
         zone_on: bool | None = None
         muted: bool | object | None = _UNCHANGED
         if restore:
             zone_on, muted = await self._async_force_silent(group)
+            if muted is True and level is not None:
+                self._held_level[group] = level
+                self.apply_optimistic(group, volume_db=level)
+            else:
+                self._volume_unverified.add(group)
         power = await self._async_read_group_power(op)
         if power is None:
             power = dict(self.data.group_power) if self.data is not None else {}
@@ -749,6 +797,122 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                 return volume
         self._volume_unverified.add(group)
         return None
+
+    # --- volume and mute -----------------------------------------------------
+    #
+    # ANY volume change un-mutes a zone on this amplifier -- an absolute set,
+    # up, down, even on a switched-off zone (measured 2026-09-27). A source
+    # change does not. So a zone that is muted, or whose mute cannot be read,
+    # is never sent a volume: the level is held and shown, and applied when the
+    # zone is unmuted. The caller holds the command lock for all of these.
+
+    async def async_write_volume(self, group: int, db: int) -> None:
+        """Set a zone's volume, or hold it while the zone is muted."""
+        if await self._async_read_mute_or_refuse(group):
+            self._hold(group, db)
+            return
+        self._held_level.pop(group, None)
+        await self.client.set_volume(group, db)
+        self.apply_optimistic(group, volume_db=db, muted=False)
+
+    async def async_step_volume(self, group: int, delta: int, ceiling_db: int) -> None:
+        """Move one device dB, within the ceiling and floor.
+
+        The baseline is read from the amplifier inside the lock, not taken from
+        the cache: a stale level would turn a step into a jump. A muted zone
+        steps its held level instead, and nothing is sent.
+        """
+        client = self.client
+        if await self._async_read_mute_or_refuse(group):
+            base = self._held_level.get(group)
+            if base is None:
+                base = await client.get_volume(group)  # a read does not un-mute
+            if base is not None:
+                self._hold(group, max(MIN_VOLUME_DB, min(ceiling_db, base + delta)))
+            return
+        self._held_level.pop(group, None)
+        current = await client.get_volume(group)
+        if current is None:
+            if delta < 0:
+                await client.volume_down(group)
+                return
+            # Up against an unread level: the device's own step, unless the last
+            # known level is already at the ceiling it would cross.
+            state = self.data.groups.get(group) if self.data is not None else None
+            if (
+                state is not None
+                and state.volume_db is not None
+                and state.volume_db >= ceiling_db
+            ):
+                return
+            await client.volume_up(group)
+            return
+        target = max(MIN_VOLUME_DB, min(ceiling_db, current + delta))
+        if target != current:
+            await client.set_volume(group, target)
+        self.apply_optimistic(group, volume_db=target, muted=False)
+
+    async def async_set_mute(self, group: int, mute: bool) -> None:
+        """Mute or unmute; unmuting applies a held level, which is what un-mutes."""
+        self.note_user_mute(group)
+        if mute:
+            await self.client.set_mute(group, True)
+            self.apply_optimistic(group, muted=True)
+            return
+        level = self._held_level.get(group)
+        sent = False
+        try:
+            if level is not None:
+                try:
+                    await self.client.set_volume(group, level)
+                except SonanceNotSentError:
+                    raise
+                except SonanceError:
+                    sent = True
+                    raise
+                sent = True
+            # Explicitly too: a set to the level it already has may not un-mute.
+            await self.client.set_mute(group, False)
+        except SonanceError as err:
+            if sent or not isinstance(err, SonanceNotSentError):
+                # The zone may be playing now: unknown, not "muted". The hold
+                # stays until a poll reads the zone unmuted.
+                self.apply_optimistic(group, muted=None)
+            raise
+        self._held_level.pop(group, None)
+        if level is not None:
+            self.apply_optimistic(group, muted=False, volume_db=level)
+        else:
+            self.apply_optimistic(group, muted=False)
+
+    def held_level(self, group: int) -> int | None:
+        return self._held_level.get(group)
+
+    def _hold(self, group: int, db: int) -> None:
+        self._held_level[group] = db
+        self.apply_optimistic(group, volume_db=db, muted=True)
+
+    async def _async_read_mute_or_refuse(self, group: int) -> bool:
+        """Whether the zone is muted, asking twice; refuse if it cannot be told."""
+        for _ in (1, 2):
+            muted = await self.client.get_mute(group)
+            if muted is not None:
+                return muted
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="mute_unknown",
+            translation_placeholders={"zone": GROUP_LETTERS[group]},
+        )
+
+    def _shown_level(
+        self, group: int, volume: int | None, muted: bool | None
+    ) -> int | None:
+        """The level to show: a hold while confirmed muted, else the amp's."""
+        if muted is False:
+            # Un-muted, from wherever: the amp's level is the truth.
+            self._held_level.pop(group, None)
+        held = self._held_level.get(group)
+        return held if muted is True and held is not None else volume
 
     def volume_verified(self, group: int) -> bool:
         """False while the cached volume may predate the last switch-on."""

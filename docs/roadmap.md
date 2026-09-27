@@ -3,7 +3,7 @@
 Narrow first, then branching. The transport is the risky part, so it was proven under one
 entity before anything else depended on it.
 
-Status: **0.3.2.** Device facts are in [`protocol.md`](protocol.md), decisions in
+Status: **0.3.3.** Device facts are in [`protocol.md`](protocol.md), decisions in
 [`design.md`](design.md).
 
 ## Done

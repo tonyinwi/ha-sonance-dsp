@@ -290,15 +290,19 @@ Measured:
 - **The HTTP status page reflects a zone power change in 0.01–0.06 s**, a reliable
   read-back.
 
-Not measured; the integration is built to be right either way
-([Power](design.md#power)):
+Also measured 2026-09-27 (zone D, the others silent):
 
-- **Whether a wake changes zone volumes.** The integration reads a zone's level before waking.
-- **Power-on to an amp already on**, and **standby to one already in standby.**
-- **Zone-on to a zone already on.** Only off-to-on was measured. If it too re-applies the
-  turn-on volume and clears mute, a scene re-asserting "on" would reset a playing zone.
-- **Zone on/off in standby.** Volume writes in standby work (2026-09-20). The status
-  page shows zone flags in standby, and the integration logs any flag a zone-off left set.
+- ⚠️ **Any volume change un-mutes a zone**: an absolute set, `0x04`/`0x05` up and down,
+  even on a switched-off zone. A **source change does not**. This is what un-muted A–C in
+  v0.3.1, whose post-power-up volume restore ran after the mute had been verified.
+- **A zone-on to a zone already on does nothing**: no turn-on volume, no mute change,
+  unmuted or muted.
+- **A zone-off in standby is echoed, but the standby status page still shows the flag.**
+  The zone came back briefly at the wake, took its turn-on volume at ~0.56 s, and ended off.
+- **A wake does not change the stored volume of zones that are off.**
+
+Not measured; the integration does not depend on them:
+**power-on to an amp already on**, and **standby to one already in standby.**
 
 ### Turn-on volume
 
