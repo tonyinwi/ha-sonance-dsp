@@ -173,13 +173,18 @@ including what was not measured.
   else woke the amp, zones would show off while playing. An empty or malformed status page
   counts as no answer; an empty map reads as "every zone off", and would put the amp in
   standby under playing zones.
-- **Switching on restores the mute, and checks it stuck.** A zone-on clears the mute. The
-  mute is read while the zone is off (it keeps it there) and sent straight after the
-  zone-on, both frames under one hold of the protocol lock. That survived the clear in the
-  one test on an awake amp; after a wake it is unmeasured. So it is read back at 0.3, 0.6,
-  1.0 and 1.5 s (to 5 s
-  after a wake, when a zone may power up late) and re-sent on anything but a confirmed
-  "muted", including no answer. Without a confirmed read the switch-on has failed. If the
+- **Switching on is silent only with a −70 dB turn-on volume.** For about a second after a
+  zone-on the amp plays unmuted at the zone's turn-on volume, and no command changes that
+  ([protocol](protocol.md#power-measured-in-power-button-mode)). So every zone's turn-on
+  volume is set to −70 dB on the amp, and once the window has passed the level the zone
+  had while off is put back, capped at the ceiling and checked by read-back. That level is
+  read from the amp (an off zone reports it), so it survives a restart. A restore that
+  fails leaves the zone on at −70, and says so.
+- **Switching on restores the mute, and checks it stuck.** The mute is read while the zone
+  is off (it keeps it there) and sent straight after the zone-on, both frames under one
+  hold of the protocol lock. It is read back at 0.3, 0.6, 1.0 and 1.5 s (to 5 s after a
+  wake) and re-sent on anything but a confirmed "muted", including no answer; the amp
+  re-applies it at ~1.05 s. Without a confirmed read the switch-on has failed. If the
   pre-read fails, the last polled value is used; with none, the zone comes on muted.
 - **A muted zone's switch-on that breaks part-way leaves it silent.** If a step after the
   zone-on fails (a lost echo, an unconfirmed mute), the zone is muted and checked again;
@@ -250,6 +255,9 @@ including what was not measured.
 
 Known limits, each needing an unmeasured behaviour or an unlikely combination:
 
+- **A scene passes through the zone's old level.** HA reproduces a scene as `turn_on` then
+  `volume_set`, so a zone plays briefly at its restored level before the scene's own. In a
+  script, call `volume_set` before `turn_on`: the restore reads the off zone's level.
 - **Scene order affects latency.** Switching zone B, the last one playing, off before zone
   A on puts the amplifier in standby and then wakes it (~10 s). The end state is right.
   List the zones being switched on first.

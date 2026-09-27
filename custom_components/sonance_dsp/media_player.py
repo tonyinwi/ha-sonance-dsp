@@ -404,7 +404,9 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
         From standby this takes about ten seconds: commands sent while the amp
         boots are dropped, so nothing else can be sent until it has finished.
         """
-        await self.coordinator.async_turn_on(self._group)
+        await self.coordinator.async_turn_on(
+            self._group, ceiling_db=self._effective_max_db
+        )
 
     @command
     async def async_turn_off(self) -> None:
