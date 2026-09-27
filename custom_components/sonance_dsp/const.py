@@ -70,7 +70,8 @@ MAX_VOLUME_DB: Final = 12
 
 # Default ceiling for the HA 0-100% mapping. The device can reach +12 dB, but
 # that is the factory turn-on default the vendor's own Savant notes flag as a
-# hazard, so it is opt-in per zone via the options flow rather than the default.
+# hazard, so raising it is a deliberate change in the options flow (one ceiling
+# for every zone, lowered per zone to the amplifier's own maximum).
 DEFAULT_MAX_DB: Final = 0
 
 
@@ -147,9 +148,9 @@ FORBIDDEN_OPCODES: Final = frozenset(range(0x21, 0x29))
 # can prove a reply belongs to the query that asked for it, so every scoped
 # getter must check it rather than parsing the value and discarding the letter.
 #
-# Mute and Source are IGNORECASE because no literal device output for them has
-# been recorded -- only 'Power status :On' is known, and that one capitalises.
-# Capture a real reply and record it in docs/protocol.md before tightening.
+# Mute and Source stay IGNORECASE as cheap insurance. Their query replies are
+# recorded ("Cmd:MuteState   ,Group:D Mute=on", "Cmd:Source1     ,Group:D
+# Src1=<name>") -- see docs/protocol.md.
 RE_VOLUME: Final = re.compile(r",\s*Group:([A-H])\s+Vol=(-?\d{1,2})\s*db")
 RE_MUTE: Final = re.compile(r",\s*Group:([A-H])\s+Mute=(on|off)", re.IGNORECASE)
 RE_SOURCE: Final = re.compile(r",\s*Group:([A-H])\s+Src(\d)=(.+?)\s*$", re.IGNORECASE)

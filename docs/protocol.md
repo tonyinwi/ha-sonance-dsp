@@ -1,30 +1,25 @@
 # Sonance DSP protocol reference
 
-Verified against a live **DSP 8-130 MKII, firmware V2.2.8130** on 2026-09-20.
-
-This document records what the *device* does. Where it contradicts the vendor
-spreadsheet (`DSP_IP_Codes_SONANCE.xlsx`) or the Savant profile, the device wins and the
-contradiction is called out — those cases are the ones that break naive implementations.
+What the device does, measured on a **DSP 8-130 MKII, firmware V2.2.8130**, on 2026-09-20
+unless dated otherwise. Where the vendor spreadsheet (`DSP_IP_Codes_SONANCE.xlsx`) or the
+Savant profile disagrees, the device wins and the contradiction is called out. Decisions:
+[`design.md`](design.md).
 
 ## Transports
 
-The amplifier answers on two ports, and each knows something the other does not.
-
 | | TCP 52000 | HTTP 80 |
 |---|---|---|
-| Purpose | control — set and query | identity, names, group power |
 | Format | binary frames | JSON |
-| Serial / model / firmware | ✗ | ✓ |
-| Zone + source **names** | partial | ✓ |
-| **Per-group power** | ✗ *(no such opcode)* | ✓ |
-| Channel→group map | only "empty or not" | ✓ authoritative |
-| Volume / mute / source set | ✓ | — |
-
-Use **TCP for writes and fast state, HTTP for identity, discovery and group power.**
+| Set volume / mute / source / power | yes | not used (see *Writes*) |
+| Serial, model, firmware | no | yes |
+| Zone and source names | partial | yes |
+| Per-group power | no, no such opcode | yes |
+| Channel→group map | only "empty or not" | yes, authoritative |
 
 ### HTTP endpoints
 
-Undocumented in any vendor artifact — found by reading the web UI's own JavaScript.
+Undocumented by the vendor; found in the web UI's JavaScript. JSON is served as
+`text/html`.
 
 ```
 GET /Web/Handler.php?page=status&action=read
@@ -32,17 +27,12 @@ GET /Web/Handler.php?page=in-out-settings&action=read
 GET /Web/Handler.php?page=general-settings&action=read
 ```
 
-⚠️ **Use `in-out-settings`, not `basicsettings`.** Both exist and both answer, which is what
-makes this worth writing down: `basicsettings` is an older, cut-down view of the same data
-and returns **none** of `turn-on-volumes`, `maximum-volumes`, `gain-offset`, `level-trim-dBs`,
-`stereo-or-mono`, `mode-sources` or `sources-2`. A wrong-but-working endpoint is harder to
-notice than a broken one.
+**Use `in-out-settings`, not `basicsettings`.** Both answer, but `basicsettings` is an
+older, cut-down view lacking `turn-on-volumes`, `maximum-volumes`, `gain-offset`,
+`level-trim-dBs`, `stereo-or-mono`, `mode-sources` and `sources-2`. It is also the one
+`Landing.htm` leads to; the In/Out tab is linked only from inside `GeneralSettings.htm`.
 
-It is also the harder one to find. `Landing.htm` links only `BasicSetting.htm` and
-`GeneralSettings.htm`; the In/Out and EQ tabs are linked from *inside* `GeneralSettings.htm`,
-so following the landing page alone leads to the lesser endpoint.
-
-`status` returns per-group power and mute:
+`status`: per-group power and mute.
 
 ```json
 {"status-titles":["GROUP A", ...],
@@ -50,7 +40,8 @@ so following the landing page alone leads to the lesser endpoint.
  "mute-volumes":["off","off","off","off","off","off","off","off"]}
 ```
 
-`in-out-settings` returns the zone topology and every per-channel setting:
+`in-out-settings`: zone topology and every per-channel setting, each list indexed by
+channel, 1L through 4R.
 
 ```json
 {"output-names":["Zone 1 L","Zone 1 R","Zone 2 L", ...],
@@ -60,39 +51,29 @@ so following the landing page alone leads to the lesser endpoint.
  "output-volumes":["-27","-27", ...]}
 ```
 
-Every list is indexed by channel, 1L through 4R. Beyond the fields above it also returns
-`turn-on-volumes`, `maximum-volumes`, `gain-offset`, `level-trim-dBs`, `stereo-or-mono`,
-`bridge-modes`, `mode-sources` and `sources-2`.
+It also returns `turn-on-volumes`, `maximum-volumes`, `gain-offset`, `level-trim-dBs`,
+`stereo-or-mono`, `bridge-modes`, `mode-sources`, `sources-1` and `sources-2`. Three
+change how the device should be driven:
 
-Three of those change how the device should be driven:
+- **`maximum-volumes`**: the amp's own per-channel ceiling. No integration setting can
+  raise a zone past it, and a group is only as loud as its most restricted channel.
+- **`gain-offset`**: installer calibration, so **dB is not comparable between zones**.
+  Two zones at −27 dB with offsets of −6 and +4 are 10 dB apart.
+- **`sources-1` / `sources-2`**: indices into `input-names`, each channel's two assignable
+  source slots; `mode-sources` sets what slot 2 does. An assignment, not a selection: the
+  TCP source query says which input is live. Distinct from the TCP `source 1–4` commands,
+  which pick one of four input pairs.
 
-- **`maximum-volumes`** is the amplifier's *own* per-channel ceiling. An integration's own
-  volume limit cannot raise a zone past it, and a group is only as loud as its most
-  restricted channel.
-- **`gain-offset`** is installer calibration, and it means **a dB figure is not comparable
-  between zones**: two zones both reading −27 dB with offsets of −6 and +4 are ten dB apart
-  in practice. Anything that averages zone volumes has to say so.
-- **`sources-1` / `sources-2`** are indices into `input-names`, giving each output channel's
-  two assignable source slots. `mode-sources` toggles the second. This is an *assignment*,
-  not a selection — which slot is live comes from the TCP source query.
+`general-settings`: `serial-number`, `amplifier-name`, `amplifier-model`,
+`firmware-version` and network config. The serial is the stable identity; these amps are
+usually on DHCP.
 
-Note the UI's "Source 1 / Source 2" rows are a different concept from the TCP `source 1–4`
-commands: the former are the two assignable slots per channel, the latter select among the
-four physical input pairs.
+### Writes
 
-`general-settings` returns `serial-number`, `amplifier-name`, `amplifier-model`,
-`firmware-version`, and network config. **Use `serial-number` as the config entry's
-`unique_id`** — the amp is typically on DHCP, so the IP is not stable identity.
-
-⚠️ There is also an `action=write` form. This integration does not use it — everything
-writable is writable over TCP, and TCP is where the reply can be correlated.
-
-Be precise about why, because the reason is narrower than it first looked. A
-`name=output-group` write was observed **returning unchanged JSON for a change it did not
-apply**, with the amplifier in standby. A `name=output-volume` write, by contrast, applies
-reliably — verified during the push experiment. So the endpoint is not broadly unreliable;
-one field is, and the safe rule is to read over HTTP and write over TCP rather than to
-model which fields can be trusted.
+An `action=write` form exists. A `name=output-group` write returned unchanged JSON for a
+change it did not apply (amp in standby); a `name=output-volume` write applied reliably
+(during the push test). One field misbehaves, not the endpoint. The integration writes
+only over TCP.
 
 ## Frame format
 
@@ -100,64 +81,54 @@ model which fields can be trusted.
 FF 55 <LEN> <OPCODE> [<OPERAND>]
 ```
 
-No terminator. No checksum. `LEN` is `01` for amplifier-wide commands (opcode only) and
-`02` for scoped ones (opcode plus one operand). Groups are **0-based**: A=`0x00` … H=`0x07`.
+No terminator, no checksum. `LEN` is `01` for amplifier-wide commands (opcode only) and
+`02` for scoped ones (opcode plus operand). Groups are **0-based**: A=`0x00` … H=`0x07`.
 
 ## Replies
 
-**Exactly 50 bytes, NUL-padded, no terminator.** The vendor docs say space-padded; the
-device sends `\0`. There is nothing to `readline()` on — a line-oriented reader hangs
-forever. Read exactly 50 bytes under a timeout.
+**Exactly 50 bytes, NUL-padded (the vendor docs say space), no terminator.** `readline()`
+hangs forever; read exactly 50 bytes under a timeout. Changes to sources 2–4 are the
+exception (below).
 
-Two reply shapes, and they differ in whitespace:
+Query replies and command echoes differ in whitespace:
 
 ```
 query reply : "Cmd:Volume      ,Group:D Vol=-27 db"    6 spaces, space before db
 command echo: "Cmd:VolumeUP   ,Group:D Vol=-27db"      3 spaces, NO space before db
 ```
 
-So match `Vol=(-?\d{1,2})\s*db`, never a literal `" db"`. An absolute volume set echoes as
-`VolumeUP` regardless of direction — the `Cmd:` label does not tell you what was sent.
+Mute query: `Cmd:MuteState   ,Group:D Mute=on` (captured 2026-09-20).
 
-**An empty reply means the group has no channels.** That is the zone-enumeration mechanism,
-and it is only trustworthy on a settled persistent connection.
+Match `Vol=(-?\d{1,2})\s*db`, never a literal `" db"`. An absolute set echoes `VolumeUP`
+whatever the direction, so `Cmd:` does not say what was sent. Scoped replies echo their
+`Group:` letter, the only field that ties a reply to its request.
+
+**No reply, or 50 NUL bytes, means the group has no channels**, which is how zones are
+enumerated (on a settled connection only; see churn below).
 
 ## Connection behaviour
 
-Three findings that are not in any vendor document and that dictate the client design:
+None of this is in the vendor docs.
 
-1. **One TCP session only.** With two sockets open concurrently, socket 1 received *both*
-   replies and socket 2 received nothing. A second connection does not merely fail — it
-   silently corrupts the first socket's reply stream. Hold exactly one connection for the
-   config entry's lifetime.
-2. **A single socket pipelines correctly.** Three queries down one connection returned three
-   ordered 50-byte replies. FIFO future-correlation is sound.
-3. **Connection churn drops replies.** Rapid connect-query-disconnect cycles produced
-   missing and all-NUL responses, reproducibly. Another reason for one persistent socket,
-   and a reason not to trust "empty reply" on a freshly opened one.
+1. **One TCP session only.** With two sockets open, socket 1 received *both* replies and
+   socket 2 nothing. A second connection silently corrupts the first one's reply stream.
+2. **One socket pipelines correctly.** Three queries returned three ordered replies. The
+   client serialises anyway; see [`design.md`](design.md).
+3. **Connection churn drops replies.** Rapid connect-query-disconnect cycles gave missing
+   and all-NUL replies, reproducibly, so an empty reply on a fresh socket proves nothing.
 
 ## Volume
 
-`byte = dB + 183`, range −70 … +12 dB in 1 dB steps.
+`byte = dB + 183`, −70 … +12 dB in 1 dB steps.
 
-| dB | byte |
-|---|---|
-| −70 | `0x71` |
-| −27 | `0x9C` |
-| 0 | `0xB7` |
-| +12 | `0xC3` |
+| dB | −70 | −27 | 0 | +12 |
+|---|---|---|---|---|
+| byte | `0x71` | `0x9C` | `0xB7` | `0xC3` |
 
-**Absolute set is verified working on V2.2.8130**, despite the spreadsheet documenting it
-only for V2.51. Tested 2026-09-20 on group D with nothing connected and the amp in standby:
-
-| Sent | Read back |
-|---|---|
-| `FF 55 02 8F 03` (−40) | `Vol=-40 db` ✅ |
-| `FF 55 02 80 03` (−55) | `Vol=-55 db` ✅ |
-| `FF 55 02 71 03` (−70) | `Vol=-70 db` ✅ |
-| `FF 55 02 9C 03` (−27) | `Vol=-27 db` ✅ |
-
-No stepping fallback is needed.
+**Absolute set works on V2.2.8130**, though the spreadsheet documents it only for V2.51.
+On group D (nothing connected, amp in standby), sets to −40, −55, −70 and back to −27
+(`FF 55 02 8F 03`, `80`, `71`, `9C`) each read back exactly. No stepping fallback is
+needed.
 
 ## Command reference
 
@@ -189,7 +160,7 @@ GET OVERTEMP           FF 55 02 18 <C>
 
 ## Source: two traps, both measured
 
-Captured on group D (no speakers connected) on 2026-09-20.
+Group D, no speakers connected.
 
 ### `Src1=` names the Source 1 slot, not a source number
 
@@ -199,30 +170,23 @@ select source 3  ->  query answers  'Cmd:Source1     ,Group:D Src1=Sonos L Analo
 select source 4  ->  query answers  'Cmd:Source1     ,Group:D Src1=Input 4L'
 ```
 
-**Both `Cmd:Source1` and `Src1=` stay `1` whatever is selected.** Only the name changes. A
-parser that reads the digit as the source number gets `1` forever.
+**`Cmd:Source1` and `Src1=` stay `1` whatever is selected**; only the name changes. The
+`1` is the manual's **Source 1** slot (the routed source; **Source 2** is an override,
+below), and the query reports which input is in it.
 
-The reason is in the manual's terminology rather than a firmware quirk. Each output
-channel has two source *slots*, **Source 1** (the routed source) and **Source 2** (an
-override for paging or a doorbell, see below). The query reports which input is assigned
-to **slot 1**, so the `1` is the slot, and it was never meant to be a source number. An
-earlier version of this document called it a "fixed label"; the behaviour described was
-right, the explanation was not.
+Resolve the source by **name** through `input-names`. Inputs are stereo pairs (indices 0/1
+are source 1, 2/3 source 2, …) and a group query reports its left member, so the name is
+normally the even index.
 
-Resolve the source from the **name** instead, through `input-names` from the HTTP endpoint.
-Inputs are stereo pairs, so indices 0/1 are source 1, 2/3 are source 2, and so on; a group
-query reports its LEFT member, so the name is normally the even index of the pair.
+### Source 2 and Mode Source 2: a hardware override
 
-### Source 2 and Mode Source 2: a hardware override layer
+Not used here; easy to mistake for routing. Per channel, **Source 2** is a
+second input and **Mode Source 2** sets what it does (MKIII manual, In/Out Settings):
 
-Not used by this integration, recorded because it is easy to mistake for routing. Per
-channel, **Source 2** is a second input and **Mode Source 2** decides what it does
-(MkIII manual, In/Out Settings):
-
-- `OFF` -- *"Source 2 has no effect on the operation of the channel."*
-- `MIX` -- *"Input levels will be attenuated by 6dB, and signals will be summed."*
-- `MUTE` -- *"Source 1 will be muted while Source 2 is active."* Audio-sensed ducking,
-  intended for a doorbell or paging input.
+- `OFF`: no effect on the channel.
+- `MIX`: both inputs attenuated 6 dB and summed.
+- `MUTE`: Source 1 muted while Source 2 is active. Audio-sensed ducking for a doorbell or
+  paging input.
 
 Readable over HTTP as `sources-2` and `mode-sources`; no TCP opcode for either is known.
 
@@ -234,140 +198,105 @@ SET source 2  ->  256B:  [0]      'Cmd:Source2     , Group:D'
 SET source 1  ->   50B:  [0]      'Cmd:Source1     , Group:D'
 ```
 
-The payload is in the first 50 bytes; the rest is padding. Opcodes `0x0A`/`0x0B`/`0x0C` pad
-to 256, `0x09` does not — reproducible across repeats.
+Payload in the first 50 bytes, NUL after, all in one TCP segment. Opcodes
+`0x0A`/`0x0B`/`0x0C` pad to 256 and `0x09` does not, reproducibly.
 
-A client reading a fixed 50 bytes takes the first frame and leaves **206 NUL bytes queued**,
-so the next four commands read pure padding and look like "no reply" before the fifth
-resynchronises. Any client that sends a source change must drain to the end of the frame.
+Reading a fixed 50 leaves **206 NUL bytes queued**: the next four commands read padding
+and look like "no reply", and the fifth resynchronises. Drain to the end of the frame after
+every source change.
 
-This is the same class of problem the sibling Triad AMS integration solves with an adaptive
-drain — its comments describe firmware that pads to 150 bytes and firmware that terminates
-with a single NUL. The variation is not only across firmware revisions: on this amplifier it
-varies **by opcode within one firmware**.
+The sibling Triad AMS integration drains adaptively because its firmware revisions differ
+(150-byte padding, or one NUL). Here it varies **by opcode within one firmware**.
 
-## ⛔ Forbidden: channel→group assignment
+## Forbidden: channel→group assignment
 
 **Opcodes `0x21`–`0x28`** reassign channels between groups (`0x21`→A, `0x22`→B, …).
 
-They are destructive, there is no safe inverse without a prior backup, and — critically —
-**the echo lies.** Sending `FF 55 02 22 0A` (assign channel 2L to group B) returned
-`Channel <name> group is B` for a change that never applied; the authoritative
-`output-groups` still read `a` for that channel afterwards. The vendor's
-own HTTP write endpoint failed the same way. Both appear to be refused while the amp is in
-standby, while still reporting success.
+They are destructive, have no safe inverse without a prior backup, and **the echo lies**:
+`FF 55 02 22 0A` (channel 2L to group B) returned `Channel <name> group is B`, yet
+`output-groups` still read `a` for that channel. The HTTP `output-group` write failed the
+same way (*Writes*, above). Both appear to be refused in standby while reporting success.
 
-This integration must never send these opcodes, and no service may surface them. Group
-topology is configured in the amp's web UI at `http://<amp>/BasicSetting.htm`.
-
-**Generalise the lesson: never treat this device's echo as confirmation of a config write.**
-Read back over HTTP instead.
+The integration never sends them ([Forbidden operations](design.md#forbidden-operations)).
+Group topology is set in the amp's web UI, `http://<amp>/BasicSetting.htm`.
 
 ## Timing
 
-From the Savant profile's own inter-command delays, not measured here:
+From the Savant profile, not measured:
 
 - ~5 ms between consecutive commands
 - 100–200 ms after a query before the next command
 - 1000 ms after power-on before querying volume
 
-The vendor's power-on sequence is amp on → group on (200 ms) → query volume (1000 ms),
-rather than a bare group-on. Their power-off sends group-off **twice**, which suggests a
-single one proved unreliable.
+Savant powers on as amp on → group on (200 ms) → query volume (1000 ms), and powers off
+by sending group-off **twice**.
 
 ## Power: measured in Power Button mode
 
-Everything here was measured on 2026-09-26, silently, with the source idle. It
-assumes the amplifier's **Auto On method is Power Button with every channel's
-sleep set to OFF**, which is the vendor's own recommendation for IP control
-(*"When controlling the amplifier using IP and IR commands we suggest using the
-Power Button Auto On mode."*). In `Audio` mode the amplifier wakes zones on
-signal by itself, and in `Audio Green` it also drops the network while asleep.
+Measured 2026-09-26, silently, source idle, with the amp's **Auto On method set to Power
+Button and every channel's sleep OFF**: the vendor's advice for IP and IR control. In
+`Audio` mode the amp wakes zones on signal by itself; in `Audio Green` it also drops the
+network while asleep.
+
+Replies verbatim, padding included:
 
 | Command | Reply | Notes |
 |---|---|---|
-| `FF 55 02 65 <N>` zone on | `Cmd:GroupON      ,Group:X` | one command is enough |
-| `FF 55 02 66 <N>` zone off | `Cmd:GroupOFF      ,Group:X` | the Savant profile sends this twice; not needed here |
-| `FF 55 02 07 <N>` mute on | `Cmd:MuteOn      , Group:X` | note the space after the comma |
+| `FF 55 02 65 <N>` zone on | `Cmd:GroupON      ,Group:X` | one is enough |
+| `FF 55 02 66 <N>` zone off | `Cmd:GroupOFF      ,Group:X` | one is enough (Savant sends two) |
+| `FF 55 02 07 <N>` mute on | `Cmd:MuteOn      , Group:X` | space after the comma |
 | `FF 55 02 08 <N>` mute off | `Cmd:MuteOff     , Group:X` | |
 | `FF 55 01 01` amp on | `Cmd:PowerOn` | starts a ~10 s boot |
 | `FF 55 01 02` amp standby | `Cmd:PowerOff` | network stays up |
 | `FF 55 01 70` amp query | `Power status :On` / `:Off` | the only master-power read |
 
-The echoes above are verbatim, padding included, as captured on 2026-09-26. The
-integration checks every power and mute write against its own echo -- command and
-group letter -- because with the status page down the echo is the only confirmation
-there is, and a frame of padding or another group's late reply is not one. Any word
-in the amplifier-power reply other than `On` or `Off`, and any status-page power
-value other than `on` or `off`, is read as unknown, never as off.
+Only `On` and `Off` have been seen from the amp query. The integration reads any other
+word there, and any status-page value but `on`/`off`, as unknown, never off.
 
-What each command actually does:
+Measured:
 
-- **Switching a zone on clears its mute**, and applies the zone's turn-on
-  volume. The clear was already visible at the first sample, about 0.5 s after
-  the zone-on, and a mute sent about 0.5 s after the zone-on stuck.
+- **Switching a zone on clears its mute** and applies its turn-on volume. The clear was
+  visible at the first sample, about 0.5 s after the zone-on, and a mute sent about 0.5 s
+  after the zone-on stuck.
 
-  ⚠️ *Corrected 2026-09-26.* This line used to say "re-muting immediately
-  afterwards sticks". The probe behind it waited out a 0.5 s receive timeout
-  after every command, so its "immediate" mute went out half a second later,
-  after the clear had landed. Whether a mute sent within one round trip of the
-  zone-on survives the clear is **unmeasured**. The integration reads the mute
-  back across the window and re-sends it.
-- **Standby and wake do not clear mute.** Zones muted before standby are still
-  muted after it.
-- **A switched-off zone still answers.** Volume, mute and source are all
-  readable with the zone off -- so "it answered" does not mean "it is on".
-- **A zone's on/off flag survives standby.** The HTTP status page reports a
-  zone `on` while the whole amplifier is in standby. A zone is only producing
-  output when the amplifier is on **and** the zone is on.
-- **Switching every zone off does not put the amplifier in standby.** Master
-  power stayed `On` with all four zones off.
-- **Standby keeps the network up.** TCP and HTTP both answered with master
-  power `Off`, so a controller can always wake it.
-- **A wake takes about 10 s** (10.6 s measured; the manual says 9-12), and
-  **mute writes sent before it finished were lost even though they echoed
-  success.** Zone-on writes sent in the same window *were* applied. Why the two
-  differed was not established -- one explanation that fits is that the mute
-  clear lands when a zone actually powers up, over any mute sent before it.
-  The integration's policy is the conservative one: nothing but status queries
-  until the amplifier reports `On`.
-  Status queries during the boot are fine.
-- **The HTTP status page reflects a zone power change in 0.01-0.06 s**, which
-  makes it a reliable read-back.
+  *Corrected 2026-09-26:* an earlier "re-muting immediately sticks" came from a probe that
+  waited 0.5 s per command, so its mute went out after the clear. A mute sent within one
+  round trip of the zone-on is **unmeasured**.
+- **Standby and wake do not clear mute.**
+- **A switched-off zone still answers** volume, mute and source queries, so answering does
+  not mean on.
+- **A zone's on/off flag survives standby.** The status page reports a zone `on` while the
+  amp is in standby. A zone plays only when the amp **and** the zone are on.
+- **Switching every zone off does not put the amp in standby.** Master power stayed `On`.
+- **Standby keeps the network up.** TCP and HTTP both answered with master power `Off`.
+- **A wake takes about 10 s** (10.6 s measured; manual: 9–12). **Mute writes sent
+  during it were lost although they echoed success**; zone-on writes in the same window
+  were applied. Cause unknown; one fit is that the mute clear lands when a zone actually
+  powers up. Status queries during the boot are fine.
+- **The HTTP status page reflects a zone power change in 0.01–0.06 s**, a reliable
+  read-back.
 
-These were **not** measured, and the integration is written to be right
-either way rather than to depend on them:
+Not measured; the integration is built to be right either way
+([Power](design.md#power)):
 
-- **How soon after a zone-on a mute survives.** See the correction above. The
-  mute is read back at 0.3, 0.6, 1.0 and 1.5 s and re-sent whenever it reads
-  off, and the log records when that happens -- so the first time it does, the
-  answer is in the log.
-- **Power-on sent to an amplifier that is already on**, and **standby sent to
-  one already in standby.** Power-on is only ever sent straight after a read of
-  `Off`; if the amplifier's power cannot be read, nothing is switched.
-- **A zone-on sent to a zone that is already on.** Only off-to-on was measured.
-  If it re-applies the turn-on volume and clears mute the way off-to-on does, a
-  scene re-asserting "on" would reset a playing zone. So it is never sent to a
-  zone the amplifier reports on.
-- **Zone commands while the amplifier is in standby.** Volume writes in standby
-  were measured to work (2026-09-20); zone on/off was not. Waking brings back
-  every zone whose flag survived standby, so before a wake the integration
-  switches the other flagged zones off, then again after it in case standby
-  ignored or did not answer the first attempt. Its debug log says which it was
-  -- the status page shows the flags in standby -- so this answers itself the
-  first time it happens.
+- **How soon after a zone-on a mute survives.** The integration logs the delay whenever a
+  read-back finds a restored mute lost, so the first occurrence answers it.
+- **Power-on to an amp already on**, and **standby to one already in standby.**
+- **Zone-on to a zone already on.** Only off-to-on was measured. If it too re-applies the
+  turn-on volume and clears mute, a scene re-asserting "on" would reset a playing zone.
+- **Zone on/off in standby.** Volume writes in standby work (2026-09-20). The status
+  page shows zone flags in standby, and the integration logs any flag a zone-off left set.
 
 ### Turn-on volume
 
-Per zone, in the In/Out tab: either a fixed level, or `LAST` to keep the volume
-across a power cycle. A zone power-on over IP applies it -- the manual only
-mentions the power switch and sleep. The web UI appears to store `LAST` as the
-out-of-range value `13`; that is inferred from its JavaScript and unverified.
+Per zone, in the In/Out tab: a fixed level, or `LAST` to keep the volume across a power
+cycle. A zone power-on over IP applies it; the manual mentions only the power switch and
+sleep. The web UI appears to store `LAST` as the out-of-range value `13` (inferred from its
+JavaScript, unverified).
 
 ## Push: tested, and it does not
 
-**The amplifier sends nothing unsolicited when state is changed out of band.** Tested
-2026-09-20 on a DSP 8-130 MKII, firmware V2.2.8130:
+**The amplifier sends nothing unsolicited when state changes out of band.**
 
 ```
 idle baseline, 20s                      0 unsolicited frames
@@ -376,32 +305,23 @@ out-of-band volume change over HTTP     0 unsolicited frames
 control query on the same socket        1 frame, 10 ms
 ```
 
-The control step is the part that makes it a result rather than an absence. Without it,
-"zero frames" is indistinguishable from a reader that was never working — the query came
-back on the same socket that had just sat silent for forty seconds, so the socket was alive
-throughout and the silence was the amplifier's.
+The control query makes this a result rather than an absence: it came back on a socket
+that had sat silent for forty seconds, so the silence was the amplifier's. The change went
+over HTTP and was verified *before* listening began, so no socket traffic could pass for a
+push.
 
-The change was driven over HTTP and verified applied *before* the listening window, so
-nothing sent on the socket could be mistaken for a push.
-
-⚠️ **One vector remains untested: audio sense.** The sibling Triad AMS integration handles an
-unsolicited `AudioSense:Input[N]` frame, and this amplifier has the same sensing hardware —
-its `auto-on-method` is `Audio`. Triggering it needs audio to start or stop on an input.
-It would not change the design: an audio-sense event says a source woke up, not what the
-volume is, so state would still be polled.
+**Untested: audio sense.** The sibling Triad AMS integration handles an unsolicited
+`AudioSense:Input[N]` frame, and this amp has the same sensing hardware (its
+`auto-on-method` was `Audio` when push was tested). Triggering it needs audio to start or
+stop on an input.
 
 ## Still unverified
 
-- Behaviour on a malformed frame or an out-of-range volume byte. No NAK format is documented
-  anywhere.
-- Whether the amp drops a held-open idle socket, and so whether a keepalive is needed.
-- A zone-on sent to a zone that is already on, and zone on/off sent in standby. See
-  *Power* above: the integration avoids depending on either.
+- The reply to a malformed frame or out-of-range volume byte. No NAK format is documented.
+- Whether the amp drops an idle held-open socket, and so whether a keepalive is needed.
+- The unmeasured power cases under *Power*.
 
-(Whether a zone power change over TCP shows on the HTTP status page, and how fast, was on
-this list until 2026-09-26: it does, in 0.01-0.06 s.)
+## Other models
 
-## Model coverage
-
-The DSP2-150 and DSP2-750 use the same protocol with two differences: **2 sources instead
-of 4**, and **group A only**. A client covering all three needs only those two parameters.
+The DSP 2-150 and DSP 2-750 use the same protocol with **2 sources instead of 4** and
+**group A only**. Untested.

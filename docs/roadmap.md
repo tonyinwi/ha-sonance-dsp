@@ -1,132 +1,92 @@
 # Roadmap
 
-Deliberately narrow first, then branching. The MVP is one thing working correctly rather
-than everything working approximately, because the transport is the risky part and it is
-cheaper to find out it is wrong while there is one entity depending on it.
+Narrow first, then branching. The transport is the risky part, so it was proven under one
+entity before anything else depended on it.
 
-Status: **scaffolding.** The protocol is verified against hardware
-([`protocol.md`](protocol.md)) and the design settled ([`design.md`](design.md)). No
-implementation yet.
+Status: **0.3.0.** Device facts are in [`protocol.md`](protocol.md), decisions in
+[`design.md`](design.md).
 
----
+## Done
 
-## MVP — volume on one zone
+| Stage | Shipped |
+|---|---|
+| MVP | Protocol client, refusing the forbidden opcodes at the frame builder ([why](design.md#forbidden-operations)), HTTP identity, config flow keyed on serial (with `cannot_connect` recovery and duplicate-serial abort), coordinator, per-zone volume and mute |
+| 2 — all zones | Populated groups enumerated over TCP, cross-checked against the HTTP channel map, named from the device |
+| 2a — upstream mirroring | A zone shows title, artist, album, artwork and transport state from the `media_player` linked (per source, in the options flow) to its current source |
+| 3 — source and power | `SELECT_SOURCE` by the device's input names. Zone power, owned by Home Assistant: see [Power](design.md#power) |
 
-Done when moving the volume slider in Home Assistant moves the amplifier, and the amplifier
-being moved elsewhere shows up in Home Assistant.
+The amp-level entity planned for stage 2 was dropped by design: see
+[the zone is the player](design.md#the-zone-is-the-player-there-is-no-amp-level-entity).
+Music Assistant needs nothing more: each zone maps as an MA player's volume control
+([README](../README.md#music-assistant)).
 
-1. **`protocol.py`** — connect, send one frame, read exactly 50 bytes, parse. Tolerate both
-   reply whitespace forms. Refuse `FORBIDDEN_OPCODES` at the frame builder.
-2. **`http_api.py`** — read `general-settings` for serial, model, firmware, name.
-3. **`config_flow.py`** — host → HTTP identity read → `unique_id` = serial → entry, titled
-   from the amplifier's own name. Cover `cannot_connect` **and recovery from it**, plus the
-   duplicate-serial abort.
-4. **`coordinator.py`** — poll volume and mute for one group.
-5. **`media_player.py`** — one entity. `async_set_volume_level`, `volume_up` / `volume_down`,
-   `mute_volume`.
-6. **Verify end-to-end** against real hardware, not just tests.
-
-**Exit criteria**, all of which are things tests alone will not tell you:
+**MVP live checks.** Tests cannot make these, and nothing in the repo records them as done:
 
 - The slider moves the amplifier and the read-back matches.
-- Changing volume in the amplifier's web UI appears in HA within one poll interval.
-- Pulling the amplifier's network cable marks entities unavailable within one interval, and
-  they recover without restarting Home Assistant.
-- The zone appears in HomeKit **with a working volume slider** — the check that catches a
-  wrong `device_class` or a missing `VOLUME_STEP`, and the one that cannot be caught any
-  other way.
+- A volume change in the amplifier's web UI appears in HA within one poll interval.
+- A pulled network cable marks entities unavailable within one interval, and they recover
+  without restarting Home Assistant.
+- The zone appears in HomeKit **with a working volume slider**: the only check that
+  catches a wrong `device_class` or a missing `VOLUME_STEP`.
 - Assist: "set \<zone\> volume to 30 percent".
 
----
+## Next
 
-## 2 — All zones, plus the amp-level entity
+### Transport and grouping
 
-Enumerate populated groups over a settled connection, cross-checked against the HTTP
-channel→group map. One entity per zone, named from the device. Handle empty groups without
-creating phantom entities, and handle a group that exists but has no speakers wired to it.
+Pass transport controls through to the linked source's player, and route zones onto a
+common source with `media_player.join`. Both follow from
+[the zone is the player](design.md#the-zone-is-the-player-there-is-no-amp-level-entity).
 
-Add the amp-level entity on the global commands, with the drift attribute described in
-[`design.md`](design.md#the-amp-level-entity).
+### Power follow-ups
 
-## ~~2a~~ — partly done: upstream mirroring shipped
+- **Check the premise at setup.** Home Assistant owning power depends on Auto On being
+  Power Button with channel sleep off, and nothing reads it. The key is `auto-on-method`
+  (see protocol.md); which page carries it, and the channel-sleep key, are unverified. Read
+  both at setup and raise a repair issue for anything else.
+- **Turn-on volume above the ceiling.** A zone's turn-on volume (factory default +12 dB)
+  can exceed the options-flow ceiling (default 0 dB), so switching it on lands above the
+  slider's 100%.
+  `turn-on-volumes` is parsed but unused. Warn at setup, or pull the level down after the
+  read-back.
+- **Measure what the code defends against blind**, listed under *not measured* in
+  [Power: measured in Power Button mode](protocol.md#power-measured-in-power-button-mode).
+  Each needs the amplifier and a go-ahead, with the source idle. Zone-on to a zone already
+  on matters most: it would settle the one power rule that is a choice.
 
-A zone now mirrors title, artist, album, artwork and transport state from a
-media player linked to the source it is currently playing, configured per
-source in the options flow. The link follows the **route**: change a zone's
-source and its metadata moves with it.
+### 4 — Diagnostics and configuration
 
-Still open for Music Assistant proper — mapping the amp-level entity as MA's
-volume control — because the amp-level entity does not exist yet. See the note
-under it in [`design.md`](design.md#the-amp-level-entity): `gain-offset` varies
-per zone, so averaging zone volumes reports a figure matching no zone.
+- Short-protect and over-temperature per channel (`0x17` / `0x18`) as binary sensors:
+  fault reporting the amplifier already computes and nothing surfaces. The opcodes are
+  defined; nothing queries them yet.
+- `diagnostics.py` is a scaffold. Implement it, redacting the keys already in `TO_REDACT`:
+  the network block, serial and installer/customer/dealer names.
+- DSP preset as a `select` at `EntityCategory.CONFIG`, **read-only or omitted**: see the
+  DSP-tuning non-goal in [Scope](design.md#scope).
 
-## 2a (original) — Music Assistant
-
-Not an extra. Where the source device feeding the amplifier is set to **fixed output**, its
-own volume control does nothing, and MA's volume slider for that player controls nothing
-until it is mapped to this integration.
-
-- Expose the amp-level entity to MA via the HA Plugin, set it as the player's **Volume**
-  control.
-- **Leave mute native** if the source device's mute works — fixed output bypasses the
-  attenuator but not the gate, so mute usually still functions where volume does not.
-- **Never use MA's FAKE mute** in that configuration: FAKE mute works by driving volume to
-  zero, which is precisely the control that does nothing.
-- Power mapping is optional. Amplifiers set to audio-sense auto-on wake themselves.
-
-## ~~3 — Source and power~~ — done
-
-`SELECT_SOURCE` with names read from the device. Zone power written over TCP and confirmed
-over HTTP, since no group-power query exists, with Home Assistant owning power: see
-*Power* in [`design.md`](design.md#power) for the rules and what each one defends against.
-
-Follow-ups:
-
-- **Check the premise at setup.** Home Assistant owning power depends on the amplifier's
-  Auto On method being Power Button with channel sleep off, and nothing reads it. Find the
-  page and key that carry it (general-settings or in-out-settings — unverified), read it at
-  setup, and raise a repair issue when it is anything else.
-- **Turn-on volume above the configured ceiling.** A zone's turn-on volume can exceed the
-  ceiling set in the options flow (the factory default is +12 dB), and switching it on then
-  lands above the slider's 100%. Warn at setup, or pull the level down after the read-back.
-- **Measure what the code defends against without knowing:** how soon after a zone-on a
-  mute survives; a zone-on to a zone already on; zone on/off in standby; power-on to an amp
-  already on. Each needs the amplifier and a go-ahead, with the source idle.
-
-## 4 — Diagnostics and configuration
-
-Short-protect and over-temperature per channel (`0x17` / `0x18`) as binary sensors — genuine
-fault reporting the amplifier already computes and nothing currently surfaces.
-
-`diagnostics.py`, redacting the network block and the installer/customer/dealer names.
-
-DSP preset as a `select` at `EntityCategory.CONFIG`, **read-only or omitted** unless there
-is a good argument otherwise. See the DSP-tuning non-goal in [`design.md`](design.md#scope).
-
-## 5 — Quality scale
+### 5 — Quality scale
 
 Bronze, then Silver, tracked in
-[`quality_scale.yaml`](../custom_components/sonance_dsp/quality_scale.yaml). Add
-`quality_scale` to `manifest.json` only once a tier is actually met.
+[`quality_scale.yaml`](../custom_components/sonance_dsp/quality_scale.yaml).
+`quality_scale` goes into `manifest.json` only once a tier is met.
 
-## 6 — Other models
+### 6 — Other models
 
-The DSP 2-150 and 2-750 speak the same protocol with **2 sources instead of 4** and **group
-A only**. If the client carries those as parameters from the start, support is mostly a
-matter of finding someone with the hardware to confirm.
-
----
+The DSP 2-150 and 2-750 differ in two parameters ([protocol](protocol.md#other-models)).
+Discovery already finds whatever groups exist; `SOURCE_COUNT` is a fixed 4 and needs to
+become per-model. Confirming needs the hardware.
 
 ## Open questions
 
 Ranked by how much they would change the design.
 
-1. **Does the amplifier push unsolicited state?** Would move this to `local_push`. Test by
-   holding a socket idle and changing volume at the front panel.
-2. **What does a malformed frame or out-of-range volume byte return?** No NAK format is
-   documented anywhere, so error handling is currently "unparseable means failure".
-3. **Is a TCP group-power change reflected in the HTTP status page, and how fast?** Decides
-   whether group power needs optimistic state between polls.
-4. **Does the amplifier drop an idle socket?** Decides whether a keepalive is needed.
-5. **Does it advertise over mDNS, or have a stable DHCP fingerprint?** Would enable
+1. **What does a malformed frame or out-of-range volume byte return?** No NAK format is
+   documented, so an unrecognised reply is logged and treated as no answer.
+2. **Does the amplifier drop an idle socket?** Decides whether a keepalive is needed.
+3. **Does it advertise over mDNS, or have a stable DHCP fingerprint?** Would enable
    discovery, a Gold requirement.
+4. **Does audio sense push a frame?** Untested; it would not change polling.
+
+Settled, with evidence in [`protocol.md`](protocol.md): the amplifier does not push state
+(2026-09-20), and the status page shows a TCP zone-power change in 0.01–0.06 s
+(2026-09-26).

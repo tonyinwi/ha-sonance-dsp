@@ -1,126 +1,126 @@
 # Sonance DSP for Home Assistant
 
-Local control of Sonance DSP amplifiers over IP — per-zone volume, mute, source and power
-as `media_player` entities.
+Local control of Sonance DSP amplifiers over IP: per-zone volume, mute, source and power
+as `media_player` entities. Nothing else in Home Assistant speaks their TCP protocol, and
+behind a streamer at **fixed line-out** the amp is the only working volume in the room.
 
-> **Status: early.** Per-zone volume and mute work. The protocol is verified against real
-> hardware and documented in [`docs/protocol.md`](docs/protocol.md), and 111 unit tests
-> cover the client and the parsers — but the end-to-end criteria have not been checked on a
-> live install yet, so treat `v0.1.0` as a first cut rather than a finished integration.
-> Source selection, power, and the amp-level entity are not implemented; the integration
-> declares only the features it actually has.
+> [!WARNING]
+> **Personal project — provided as is, without support.**
+>
+> I built this for one installation: my own amplifier, network and Home Assistant. Its
+> decisions are made for that system. It is published in case it is useful to someone, not
+> as a supported product.
+>
+> - **No support.** Issues and pull requests may go unanswered. There is no commitment to
+>   fix bugs, add features, support other models or firmware, or keep pace with Home
+>   Assistant releases.
+> - **No warranty.** Provided as is, under the [MIT license](LICENSE). It switches real
+>   audio equipment on and off and sets its volume, so test it carefully on your own system
+>   before relying on it.
+> - **Breaking changes** can land in any release, without notice or a migration path.
+> - **Not affiliated with Sonance.** Sonance is a trademark of its owner. This project is
+>   not made, endorsed or supported by them.
+>
+> If it does not do what you need, fork it.
 
-## Why
-
-The amplifier has a TCP control protocol that nothing in Home Assistant speaks. The usual
-workaround — `shell_command` with `nc` and regex `command_line` sensors — gives you no
-entities, no state, no volume slider, and fails silently when the amp is unreachable.
-
-It also fills a real gap in a common topology. A streamer feeding a Sonance amp is often
-set to **fixed line-out**, which means the streamer's own volume control does nothing and
-the amplifier is the only working volume in the room.
+**Status.** Volume, mute, source and upstream mirroring have run on a live install since
+0.2.0; zone power is new in 0.3.0.
 
 ## Supported devices
 
 | Model | Status |
 |---|---|
-| DSP 8-130 (MkII / MkIII) | developed against a MkII, firmware V2.2.8130 |
-| DSP 2-150, DSP 2-750 | same protocol, 2 sources and group A only — untested |
+| DSP 8-130 MKII | developed against it, firmware V2.2.8130 |
+| DSP 8-130 MKIII | untested |
+| DSP 2-150, DSP 2-750 | same protocol, 2 sources and group A only; untested |
 
-Requires the amplifier to be reachable on TCP 52000 and HTTP 80.
+Needs Home Assistant 2026.9 or later, and the amp reachable on TCP 52000 and HTTP 80. The
+amp allows **one control connection**, which this holds, so it cannot share an amp with
+another controller (Savant, Control4, RTI, Crestron).
 
-## Design
+## What works
 
-Two transports, because each knows something the other does not:
+Each zone (output group) is its own player, as in Control4 room audio; there is no
+amp-level entity ([why](docs/design.md#the-zone-is-the-player-there-is-no-amp-level-entity)).
+Zones are discovered and named from the amp, and each has:
 
-- **TCP 52000** — binary control. Setting volume, mute, source, power.
-- **HTTP 80** — an undocumented JSON API found in the web UI's own JavaScript. Supplies the
-  serial number, model, firmware, zone and source names, and **per-group power status**,
-  which the TCP protocol genuinely cannot report.
+- **Volume**, set absolutely; up/down move 1 dB.
+- **Mute.**
+- **Source**, by the input names set on the amp.
+- **Mirroring**: link a source to the player feeding it, and zones on it show its track,
+  artwork and play state.
+- **Power**, owned by Home Assistant ([below](#power)).
 
-Three measured device behaviours shape the client, and all three break naive
-implementations:
+Not yet: transport pass-through to the source's player, `media_player.join`, diagnostics.
 
-1. **The amplifier accepts exactly one TCP session.** A second concurrent connection
-   receives nothing *and* its replies are delivered to the first socket, silently corrupting
-   that stream. The integration holds one connection and never opens a second.
-2. **Replies are exactly 50 bytes, NUL-padded, with no terminator.** A `readline()` client
-   hangs forever.
-3. **The query reply and the command echo use different whitespace** — `Vol=-27 db` versus
-   `Vol=-27db`. A parser written against one silently fails on the other.
-
-## Documentation
-
-| | |
-|---|---|
-| [`docs/protocol.md`](docs/protocol.md) | The protocol, with the evidence — and every place the device contradicts the vendor documentation. |
-| [`docs/design.md`](docs/design.md) | Why the integration is shaped this way, and which decisions are forced by the hardware rather than chosen. |
-| [`docs/roadmap.md`](docs/roadmap.md) | What ships when, the MVP's exit criteria, and the open questions. |
+**HomeKit:** zones are receivers, the only class HomeKit gives a volume slider, so each
+needs its own accessory-mode HomeKit instance; a UI-created bridge silently excludes them.
 
 ## Volume
 
-The device range is −70 to +12 dB. Home Assistant's 0–100% maps onto −70 dB up to a
-**per-zone configurable maximum, defaulting to 0 dB**.
+Range −70 to +12 dB. The slider tops out at a ceiling set in the options for all zones,
+**0 dB by default**, or at the amp's own per-channel maximum if lower. Going above 0 dB is
+opt-in ([why](docs/design.md#volume)).
 
-The +12 dB ceiling is reachable but deliberately not the default: it is the factory turn-on
-level, and Sonance's own integrator notes flag it as a hazard. Raising it is a conscious act.
+> [!CAUTION]
+> Switching a zone on applies its **turn-on volume** (per zone in the amp's In/Out Settings
+> tab: a fixed level, or `LAST`), and the ceiling does not limit it. The factory value is
+> +12 dB.
 
-## What works today
+## Power
 
-| | |
-|---|---|
-| Zone discovery | Enumerated from the amplifier, cross-checked against its channel map |
-| Per-zone volume | Absolute set, verified working on firmware V2.2.8130 |
-| Per-zone mute | |
-| Per-zone maximum dB | Configurable, defaulting to 0 dB rather than the device's +12 dB ceiling |
+Home Assistant owns power, built around one failure: music starting where nobody wants
+it. That needs the amp's **Auto On method at Power Button, with every channel's sleep
+off**, so nothing wakes by itself. The integration does not check this.
 
-Not yet: source selection, power, the amp-level entity, diagnostics. See
-[`docs/roadmap.md`](docs/roadmap.md).
+- Switching a zone on restores its mute, and checks it stuck.
+- Waking the amp takes about 10 s, and brings back only the zone asked for.
+- A zone already on is left alone.
+- Switching the last zone off puts the amp in standby.
+- When something cannot be read, nothing is guessed.
+
+The rules, and what each defends against: [`docs/design.md`](docs/design.md#power).
 
 ## Installation
 
-Via HACS as a custom repository:
+Via HACS, as a custom repository:
 
 1. HACS → ⋮ → Custom repositories
 2. Add `https://github.com/tonyinwi/ha-sonance-dsp`, category **Integration**
-3. Install, restart Home Assistant
-4. Settings → Devices & Services → Add Integration → **Sonance DSP**
+3. Install, then restart Home Assistant
+4. Settings → Devices & Services → Add Integration → **Sonance DSP**, and enter the amp's IP
 
-Enter the amplifier's IP. The entry is keyed on the amplifier's **serial number**, so a
-DHCP address change will not orphan it.
+The entry is keyed on the amp's **serial number**, not its IP: after an address change, add
+it again at the new address to update it. Options: volume ceiling, polling interval (default
+10 s), and the media player feeding each source.
 
-## ⛔ What this integration will not do
+## What this integration will not do
 
-**It never sends the channel-to-group assignment opcodes (`0x21`–`0x28`).**
+**It never sends the channel-to-group assignment opcodes `0x21`–`0x28`**, and the frame
+builder refuses them. They are destructive, cannot be undone safely without a backup, and
+the amp *echoes success for changes it did not apply*. Set group topology in the amp's web
+UI at `http://<amp>/BasicSetting.htm`. Evidence:
+[`docs/design.md`](docs/design.md#forbidden-operations).
 
-They are destructive, there is no safe inverse without a prior backup, and the device
-*echoes success for changes it did not apply* — `Channel <name> group is B` came back for an
-assignment that never happened, with the authoritative map still reading the old value
-afterwards. Group topology belongs in the amplifier's own web UI at
-`http://<amp>/BasicSetting.htm`.
-
-**Take a settings backup before doing anything unusual** — GeneralSettings.htm → BACKUP
-RESTORE → All Settings. The `.gen` file encodes the channel→group map, so it will restore a
-clobbered topology.
+**Back up the settings before anything unusual**: GeneralSettings.htm → BACKUP RESTORE →
+All Settings. The `.gen` file encodes the channel→group map, so it restores a clobbered
+topology.
 
 ## Music Assistant
 
-The amplifier is not a Music Assistant player and cannot become one — it has no network
-audio input, only line inputs. MA plays to whatever feeds the amp.
+The amp cannot be a Music Assistant player: it has only line inputs, so MA plays to
+whatever feeds it. In MA's player controls, map a zone to that player's **Volume** control;
+at fixed output, that is the only way MA's volume slider does anything. A source feeding
+several zones has no single volume to map: by design, each zone keeps its own.
 
-The seam is MA's **player controls**: map this integration's amp-level entity to the MA
-player's **Volume** control. Where the source device is set to fixed output, this is the
-only thing that makes MA's volume slider do anything.
+Leave **mute native** if the source's mute works, and then never use MA's *FAKE* mute: it
+drives volume to zero, the one control that does nothing.
 
-Leave **mute native** if the source device's mute works — and in that case never use MA's
-*FAKE* mute, which works by driving volume to zero, the one control that does nothing.
+## More
 
-## Credits
+[`docs/protocol.md`](docs/protocol.md) has the device facts and what was and was not measured,
+[`docs/design.md`](docs/design.md) the decisions and known limitations, and
+[`docs/roadmap.md`](docs/roadmap.md) what is next.
 
-Protocol reverse-engineered from Sonance's published IP command spreadsheet and Savant
-profile, cross-checked against the openHAB 1.x Sonance binding, and then **verified against
-live hardware** — which is where most of the corrections above came from.
-
-## License
-
-MIT
+The protocol comes from Sonance's IP command spreadsheet and Savant profile and the openHAB
+1.x Sonance binding, corrected against live hardware.
