@@ -32,6 +32,11 @@ older, cut-down view lacking `turn-on-volumes`, `maximum-volumes`, `gain-offset`
 `level-trim-dBs`, `stereo-or-mono`, `mode-sources` and `sources-2`. It is also the one
 `Landing.htm` leads to; the In/Out tab is linked only from inside `GeneralSettings.htm`.
 
+`general-settings` also carries the power settings (captured 2026-09-27):
+`auto-on-method` (`Audio`, `Audio Green`, `Power Button`, `Voltage`, `Voltage Green`) and,
+per channel, sleep as `audio-off-delay` (`1` OFF, `2` after 15 min, `3` after 3 h, named in
+`audio-off-delay-items`, titled in `audio-off-delay-titles`).
+
 `status`: per-group power and mute.
 
 ```json

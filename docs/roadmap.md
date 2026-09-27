@@ -3,7 +3,7 @@
 Narrow first, then branching. The transport is the risky part, so it was proven under one
 entity before anything else depended on it.
 
-Status: **0.3.1.** Device facts are in [`protocol.md`](protocol.md), decisions in
+Status: **0.3.2.** Device facts are in [`protocol.md`](protocol.md), decisions in
 [`design.md`](design.md).
 
 ## Done
@@ -40,13 +40,6 @@ common source with `media_player.join`. Both follow from
 
 ### Power follow-ups
 
-- **Check the premise at setup.** Home Assistant owning power depends on Auto On being
-  Power Button with channel sleep off, and nothing reads it. The key is `auto-on-method`
-  (see protocol.md); which page carries it, and the channel-sleep key, are unverified. Read
-  both at setup and raise a repair issue for anything else.
-- **Check the turn-on volume at setup.** A zone-on plays ~1 s at the turn-on volume
-  whatever the mute; the documented setup is −70 dB. `turn-on-volumes` is parsed but
-  unused: raise a repair issue for any zone above −70.
 - **Measure what the code defends against blind**, listed under *not measured* in
   [Power: measured in Power Button mode](protocol.md#power-measured-in-power-button-mode).
   Each needs the amplifier and a go-ahead, with the source idle. Zone-on to a zone already

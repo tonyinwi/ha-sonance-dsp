@@ -53,6 +53,17 @@ class AmplifierIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class PowerSetup:
+    """The amplifier settings that Home Assistant owning power depends on."""
+
+    auto_on_method: str | None
+    # Per output channel, 1L..4R: the sleep ("audio off delay") setting's
+    # display name, e.g. "OFF" or "After 15 Min", and the channel's title.
+    sleep: list[str]
+    sleep_titles: list[str]
+
+
+@dataclass(frozen=True, slots=True)
 class Topology:
     """Channel layout and per-channel settings, as the amplifier reports them.
 
@@ -207,6 +218,31 @@ class SonanceHttpApi:
             name=str(data.get("amplifier-name", "")).strip() or "Sonance DSP",
             model=str(data.get("amplifier-model", "")).strip() or "Sonance DSP",
             firmware=str(data.get("firmware-version", "")).strip(),
+        )
+
+    async def power_setup(self) -> PowerSetup:
+        """Read Auto On and the per-channel sleep settings (general-settings)."""
+        data = await self._read(HTTP_PAGE_GENERAL)
+
+        def listed(key: str) -> list:
+            value = data.get(key)
+            return value if isinstance(value, list) else []
+
+        names = {
+            str(item.get("value")): str(item.get("name"))
+            for item in listed("audio-off-delay-items")
+            if isinstance(item, dict)
+        }
+        method = str(data.get("auto-on-method") or "").strip() or None
+        # Without the item names a sleep value is only an index; better unknown
+        # than a guess that reads every channel as asleep.
+        sleep = [names[str(v)] for v in listed("audio-off-delay") if str(v) in names]
+        if len(sleep) != len(listed("audio-off-delay")):
+            sleep = []
+        return PowerSetup(
+            auto_on_method=method,
+            sleep=sleep,
+            sleep_titles=[str(t) for t in listed("audio-off-delay-titles")],
         )
 
     async def group_power(self) -> dict[int, bool]:

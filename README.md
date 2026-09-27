@@ -72,7 +72,8 @@ opt-in ([why](docs/design.md#volume)).
 
 Home Assistant owns power, built around one failure: music starting where nobody wants
 it. That needs the amp's **Auto On method at Power Button, with every channel's sleep
-off**, so nothing wakes by itself. The integration does not check this.
+off**, so nothing wakes by itself. The integration checks these, and every zone's turn-on
+volume, at setup and daily, and raises a repair issue for any that is wrong.
 
 - Switching a zone on restores its mute and then its volume, and checks both.
 - Waking the amp takes about 10 s, and brings back only the zone asked for.

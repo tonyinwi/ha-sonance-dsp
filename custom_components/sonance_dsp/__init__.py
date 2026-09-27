@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 
 from homeassistant.const import CONF_HOST, CONF_PORT, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
 
+from .checks import async_check_setup, async_remove_issues
 from .const import DEFAULT_HTTP_PORT, DEFAULT_TCP_PORT
 from .coordinator import SonanceConfigEntry, SonanceCoordinator
 from .http_api import SonanceHttpApi, SonanceHttpError
@@ -17,6 +20,7 @@ from .protocol import SonanceConnectionError, SonanceProtocol
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS: list[Platform] = [Platform.MEDIA_PLAYER]
+SETUP_CHECK_INTERVAL = timedelta(hours=24)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: SonanceConfigEntry) -> bool:
@@ -61,6 +65,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: SonanceConfigEntry) -> b
 
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # The amplifier settings power control depends on: checked now and daily,
+    # because a factory reset or a web-UI change undoes them silently. In the
+    # background, owned by the entry: setup does not wait on it, and unload
+    # cancels a check still running.
+    def _check() -> None:
+        entry.async_create_background_task(
+            hass, async_check_setup(hass, entry, coordinator), "sonance_dsp setup check"
+        )
+
+    _check()
+
+    @callback
+    def _recheck(_now: datetime) -> None:
+        _check()
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, _recheck, SETUP_CHECK_INTERVAL)
+    )
     return True
 
 
@@ -83,3 +106,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: SonanceConfigEntry) -> 
         else:
             _LOGGER.debug("Unloading an entry that was never fully set up")
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: SonanceConfigEntry) -> None:
+    """Drop this amplifier's repair issues along with its entry."""
+    async_remove_issues(hass, entry)
