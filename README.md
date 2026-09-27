@@ -50,8 +50,9 @@ Zones are discovered and named from the amp, and each has:
 - **Mirroring**: link a source to the player feeding it, and zones on it show its track,
   artwork and play state.
 - **Power**, owned by Home Assistant ([below](#power)).
-- **Transport**: play, pause, stop and skip go to the linked player, while the zone is on.
-  Playback belongs to the source, so every zone on it follows.
+- **Transport**: play, pause and stop go to the linked player, while the zone is on.
+  Playback belongs to the source, so every zone on it follows: in a scene meant to control
+  playback, include the player, not the zones. No skip, which would skip once per zone.
 
 Not yet: play and browse media, `media_player.join`, diagnostics.
 

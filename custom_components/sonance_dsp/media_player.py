@@ -10,6 +10,8 @@ reading "On, 61%" into one that shows what is actually playing.
 
 from __future__ import annotations
 
+import logging
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
@@ -26,20 +28,25 @@ from homeassistant.components.media_player import (
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_SUPPORTED_FEATURES,
-    SERVICE_MEDIA_NEXT_TRACK,
     SERVICE_MEDIA_PAUSE,
     SERVICE_MEDIA_PLAY,
-    SERVICE_MEDIA_PREVIOUS_TRACK,
     SERVICE_MEDIA_STOP,
     STATE_PAUSED,
     STATE_PLAYING,
     STATE_UNAVAILABLE,
 )
-from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
+from homeassistant.core import (
+    Context,
+    Event,
+    EventStateChangedData,
+    HomeAssistant,
+    callback,
+)
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.util.hass_dict import HassKey
 
 from .const import (
     CONF_INPUT_LINKS,
@@ -55,24 +62,36 @@ from .coordinator import SonanceConfigEntry, SonanceCoordinator
 from .entity import SonanceEntity, command
 from .protocol import GroupState
 
-# One socket, one command at a time. A coordinator centralises inbound polling
-# but does nothing to limit outbound service calls.
-PARALLEL_UPDATES = 1
+_LOGGER = logging.getLogger(__name__)
+
+# No platform-wide limit. The coordinator's command lock already sends one
+# amplifier command at a time, and a limit of 1 is one semaphore shared by every
+# zone: a transport call waiting on another integration's player would hold it,
+# so a slow player stalls every zone's mute and off, and one that calls back into
+# any zone deadlocks them all.
+PARALLEL_UPDATES = 0
 
 # Transport, passed through to the zone's linked upstream player. Offered only
 # while the zone is on: playback belongs to the SOURCE, so "play" on a zone that
 # is off would start music in every other zone on the same source, and this
 # zone would stay silent -- the failure power control exists to prevent.
+#
+# Only the idempotent controls. Every zone on a source would forward a skip, so
+# one "next track" to the streamer and its zones -- Assist, an area, a group --
+# would skip once per player.
 _TRANSPORT: dict[MediaPlayerEntityFeature, str] = {
     MediaPlayerEntityFeature.PLAY: SERVICE_MEDIA_PLAY,
     MediaPlayerEntityFeature.PAUSE: SERVICE_MEDIA_PAUSE,
     MediaPlayerEntityFeature.STOP: SERVICE_MEDIA_STOP,
-    MediaPlayerEntityFeature.NEXT_TRACK: SERVICE_MEDIA_NEXT_TRACK,
-    MediaPlayerEntityFeature.PREVIOUS_TRACK: SERVICE_MEDIA_PREVIOUS_TRACK,
 }
 _TRANSPORT_FEATURES = MediaPlayerEntityFeature(0)
 for _feature in _TRANSPORT:
     _TRANSPORT_FEATURES |= _feature
+
+# Contexts of recent forwards. A call carrying one has come back round through
+# the upstream (a group containing this zone, say), so it is dropped.
+_FORWARDED: HassKey[deque[str]] = HassKey(f"{DOMAIN}_forwarded")
+_FORWARDED_KEEP = 64
 
 # Attributes proxied verbatim from a linked upstream player.
 _LINKED_ATTRS = (
@@ -399,7 +418,8 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
 
         None when the zone is not known to be on, when nothing is linked to its
         source, when the link is unavailable, or when it points back into this
-        integration -- a loop between zones would recurse.
+        integration. A loop through another player is caught in
+        _async_pass_through.
         """
         upstream = self._linked_state()
         if upstream is None or upstream.state == STATE_UNAVAILABLE:
@@ -410,6 +430,16 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
         return upstream
 
     async def _async_pass_through(self, feature: MediaPlayerEntityFeature) -> None:
+        incoming = self._context
+        forwarded = self.hass.data.setdefault(
+            _FORWARDED, deque(maxlen=_FORWARDED_KEEP)
+        )
+        if incoming is not None and incoming.id in forwarded:
+            _LOGGER.debug("%s: dropping a forward that came back", self.entity_id)
+            return
+        # Service calls check the features before calling here, so these two
+        # refusals are reached only by a call queued before the zone went off
+        # or the player changed.
         if self._powered() is not True:
             raise ServiceValidationError(
                 translation_domain=DOMAIN,
@@ -424,12 +454,17 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
             )
         upstream = self._upstream()
         assert upstream is not None  # implied by the feature check
+        child = Context(
+            user_id=incoming.user_id if incoming is not None else None,
+            parent_id=incoming.id if incoming is not None else None,
+        )
+        forwarded.append(child.id)
         await self.hass.services.async_call(
             MEDIA_PLAYER_DOMAIN,
             _TRANSPORT[feature],
             {ATTR_ENTITY_ID: upstream.entity_id},
             blocking=True,
-            context=self._context,
+            context=child,
         )
 
     async def async_media_play(self) -> None:
@@ -440,12 +475,6 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
 
     async def async_media_stop(self) -> None:
         await self._async_pass_through(MediaPlayerEntityFeature.STOP)
-
-    async def async_media_next_track(self) -> None:
-        await self._async_pass_through(MediaPlayerEntityFeature.NEXT_TRACK)
-
-    async def async_media_previous_track(self) -> None:
-        await self._async_pass_through(MediaPlayerEntityFeature.PREVIOUS_TRACK)
 
     # --- attributes --------------------------------------------------------
 
@@ -483,16 +512,14 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
     # --- commands ----------------------------------------------------------
     #
     # Each write applies the new value to the cached state immediately rather
-    # than awaiting a refresh. Awaiting one would block the whole platform for
-    # the length of a poll (PARALLEL_UPDATES = 1), and the coordinator's
-    # refresh debounce makes a dragged slider visibly snap back to its old
-    # value first. The next scheduled poll reconciles.
+    # than awaiting a refresh. Awaiting one would hold the command lock for the
+    # length of a poll, and the coordinator's refresh debounce makes a dragged
+    # slider visibly snap back to its old value first. The next scheduled poll
+    # reconciles.
     #
-    # Each write also holds the coordinator's command lock, so one sent while
-    # a zone is being switched on waits for it rather than reaching a booting
-    # amplifier, which drops it while echoing success. PARALLEL_UPDATES alone
-    # does not cover this: Assist's relative-volume intent calls these methods
-    # directly rather than through a service call.
+    # Each write holds the coordinator's command lock: one command at a time,
+    # and one sent while a zone is being switched on waits for it rather than
+    # reaching a booting amplifier, which drops it while echoing success.
 
     @command
     async def async_turn_on(self) -> None:

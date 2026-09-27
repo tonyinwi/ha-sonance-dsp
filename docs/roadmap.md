@@ -14,7 +14,7 @@ Status: **0.4.0.** Device facts are in [`protocol.md`](protocol.md), decisions i
 | 2 — all zones | Populated groups enumerated over TCP, cross-checked against the HTTP channel map, named from the device |
 | 2a — upstream mirroring | A zone shows title, artist, album, artwork and transport state from the `media_player` linked (per source, in the options flow) to its current source |
 | 3 — source and power | `SELECT_SOURCE` by the device's input names. Zone power, owned by Home Assistant: see [Power](design.md#power) |
-| Transport | Play, pause, stop and skip passed to the linked player, only while the zone is on |
+| Transport | Play, pause and stop passed to the linked player, only while the zone is on |
 
 The amp-level entity planned for stage 2 was dropped by design: see
 [the zone is the player](design.md#the-zone-is-the-player-there-is-no-amp-level-entity).

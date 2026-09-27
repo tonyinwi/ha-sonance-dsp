@@ -1066,8 +1066,8 @@ async def test_a_direct_volume_step_during_a_wake_waits_for_it(
 ) -> None:
     """Assist's relative volume calls the entity directly, not via a service.
 
-    So PARALLEL_UPDATES does not hold it back, and without the coordinator's
-    own lock the step reaches the booting amp and is dropped -- and would have
+    So nothing but the coordinator's lock holds it back, and without it the
+    step reaches the booting amp and is dropped -- and would have
     been computed from the volume before the turn-on anyway.
     """
     amp = FakeAmp(master=False, boot_polls=5)
