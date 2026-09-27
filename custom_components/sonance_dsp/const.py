@@ -187,10 +187,10 @@ AMP_POWER_READ_INTERVAL: Final = 0.5
 # After switching a muted zone on, its mute is read back at these intervals
 # (cumulative 0.3, 0.6, 1.0, 1.5 s) and re-sent whenever it reads off.
 # Switching a zone on clears its mute; the clear was visible at the first
-# sample, about 0.5 s after the zone-on. Whether a mute sent within one round
-# trip of the zone-on survives that clear was NOT measured -- the probe that
-# seemed to show it waited 0.5 s per command -- so the restore is verified
-# rather than trusted.
+# sample, about 0.5 s after the zone-on. A mute sent within one round trip of
+# the zone-on survived it in one test on an awake amp (2026-09-27); after a
+# wake that is unmeasured, and one sample is not a guarantee, so the restore is
+# verified rather than trusted.
 MUTE_VERIFY_DELAYS: Final = (0.3, 0.3, 0.4, 0.5)
 # Straight after a wake the window runs to 5 s. Mute writes sent during a boot
 # were lost while zone-on writes were kept, which fits the clear landing when a
