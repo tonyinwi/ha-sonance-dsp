@@ -259,9 +259,12 @@ Measured:
   visible at the first sample, about 0.5 s after the zone-on, and a mute sent about 0.5 s
   after the zone-on stuck.
 
+  **A mute sent within one round trip of the zone-on survives the clear** on an awake amp
+  (2026-09-27, v0.3.0, zone D, one sample): read back muted at 0.3, 0.6, 1.0 and 1.5 s,
+  and on the status page 3 s later. After a wake it is still unmeasured.
+
   *Corrected 2026-09-26:* an earlier "re-muting immediately sticks" came from a probe that
-  waited 0.5 s per command, so its mute went out after the clear. A mute sent within one
-  round trip of the zone-on is **unmeasured**.
+  waited 0.5 s per command, so its mute went out after the clear.
 - **Standby and wake do not clear mute.**
 - **A switched-off zone still answers** volume, mute and source queries, so answering does
   not mean on.
@@ -279,8 +282,8 @@ Measured:
 Not measured; the integration is built to be right either way
 ([Power](design.md#power)):
 
-- **How soon after a zone-on a mute survives.** The integration logs the delay whenever a
-  read-back finds a restored mute lost, so the first occurrence answers it.
+- **A mute sent straight after a zone-on, right after a wake.** Measured once awake (above).
+  The integration logs the delay whenever a read-back finds a restored mute lost.
 - **Power-on to an amp already on**, and **standby to one already in standby.**
 - **Zone-on to a zone already on.** Only off-to-on was measured. If it too re-applies the
   turn-on volume and clears mute, a scene re-asserting "on" would reset a playing zone.

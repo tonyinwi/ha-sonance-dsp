@@ -361,7 +361,8 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
     # on:
     #
     #   * whether a mute sent within one round trip of a zone-on survives the
-    #     clear -- so the mute is read back across the clear window and re-sent;
+    #     clear straight after a wake (it did, once, on an awake amp) -- so the
+    #     mute is read back across the clear window and re-sent;
     #   * whether a zone-on sent to a zone that is ALREADY on re-applies its
     #     turn-on volume and clears its mute -- so it is never sent to one;
     #   * whether standby accepts a zone-off -- so zones are switched off both

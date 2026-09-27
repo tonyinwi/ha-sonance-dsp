@@ -175,8 +175,9 @@ including what was not measured.
   standby under playing zones.
 - **Switching on restores the mute, and checks it stuck.** A zone-on clears the mute. The
   mute is read while the zone is off (it keeps it there) and sent straight after the
-  zone-on, both frames under one hold of the protocol lock. Whether a mute that early
-  survives the clear is unmeasured, so it is read back at 0.3, 0.6, 1.0 and 1.5 s (to 5 s
+  zone-on, both frames under one hold of the protocol lock. That survived the clear in the
+  one test on an awake amp; after a wake it is unmeasured. So it is read back at 0.3, 0.6,
+  1.0 and 1.5 s (to 5 s
   after a wake, when a zone may power up late) and re-sent on anything but a confirmed
   "muted", including no answer. Without a confirmed read the switch-on has failed. If the
   pre-read fails, the last polled value is used; with none, the zone comes on muted.
