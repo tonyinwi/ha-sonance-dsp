@@ -18,6 +18,7 @@ from pytest_homeassistant_custom_component.common import (
 
 from custom_components.sonance_dsp.checks import async_check_setup, async_remove_issues
 from custom_components.sonance_dsp.const import DOMAIN
+from custom_components.sonance_dsp.coordinator import holds_store_key
 from custom_components.sonance_dsp.http_api import (
     AmplifierIdentity,
     PowerSetup,
@@ -159,13 +160,20 @@ async def test_removing_the_entry_removes_its_issues(hass: HomeAssistant) -> Non
 # ---------------------------------------------------------------------------
 
 
-async def test_setup_checks_now_and_daily(hass: HomeAssistant) -> None:
+async def test_setup_checks_now_and_daily(
+    hass: HomeAssistant, hass_storage: dict
+) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN, unique_id=IDENTITY.serial, data={CONF_HOST: "192.0.2.10"}
     )
     entry.add_to_hass(hass)
+    key = holds_store_key(entry.entry_id)
+    hass_storage[key] = {  # a hold saved before a restart
+        "version": 1, "minor_version": 1, "key": key,
+        "data": {"held_level": {"0": -35}, "mute_owed": []},
+    }
     power_setup = AsyncMock(return_value=replace(GOOD, auto_on_method="Audio"))
-    group = GroupState(group=0, volume_db=-27, muted=False, source_name="In1 L")
+    group = GroupState(group=0, volume_db=-70, muted=True, source_name="In1 L")
     with (
         patch("custom_components.sonance_dsp.SonanceHttpApi.identity",
               AsyncMock(return_value=IDENTITY)),
@@ -187,6 +195,7 @@ async def test_setup_checks_now_and_daily(hass: HomeAssistant) -> None:
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
         assert issue(hass, "auto_on_method", entry) is not None
+        assert entry.runtime_data.held_level(0) == -35  # loaded at setup
         calls = power_setup.await_count
 
         async_fire_time_changed(hass, dt_util.utcnow() + timedelta(hours=25))
@@ -198,6 +207,7 @@ async def test_setup_checks_now_and_daily(hass: HomeAssistant) -> None:
 
         await hass.config_entries.async_remove(entry.entry_id)
         assert issue(hass, "auto_on_method", entry) is None  # removal drops it
+        assert key not in hass_storage  # and the saved zone state
 
 
 

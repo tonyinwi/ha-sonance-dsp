@@ -207,6 +207,9 @@ CLOSE_WAIT: Final = WAKE_TIMEOUT + 15
 # After a poll fails outright, the next one comes this soon rather than a
 # whole interval later: an unavailable entity ignores turn_off.
 POLL_RETRY_AFTER: Final = 5.0
+# Held levels and owed mutes are written this long after a change; HA flushes a
+# pending write on shutdown, so a restart does not lose one.
+HOLDS_SAVE_DELAY: Final = 1.0
 # A wake that timed out is not retried for this long. Without it a scene
 # switching four zones on against an amplifier that will not wake spends
 # four full timeouts -- over a minute and a half -- with every zone command

@@ -11,9 +11,10 @@ from functools import partial
 from typing import NoReturn
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -30,7 +31,9 @@ from .const import (
     DOMAIN,
     GROUP_LETTERS,
     GROUP_POWER_STALE_AFTER,
+    HOLDS_SAVE_DELAY,
     MAX_GROUPS,
+    MAX_VOLUME_DB,
     MIN_VOLUME_DB,
     MUTE_VERIFY_DELAYS,
     MUTE_VERIFY_DELAYS_AFTER_WAKE,
@@ -55,6 +58,10 @@ from .protocol import (
 _LOGGER = logging.getLogger(__name__)
 
 type SonanceConfigEntry = ConfigEntry[SonanceCoordinator]
+
+
+def holds_store_key(entry_id: str) -> str:
+    return f"{DOMAIN}.{entry_id}.holds"
 
 
 @dataclass
@@ -152,6 +159,9 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         # (measured 2026-09-27). Applied when the zone is unmuted -- which is
         # itself done by setting it -- and shown meanwhile.
         self._held_level: dict[int, int] = {}
+        # Both survive a restart: a lost hold would unmute a zone at its silent
+        # turn-on level, and a lost owed mute could let one come back unmuted.
+        self._store: Store[dict] = Store(hass, 1, holds_store_key(entry.entry_id))
 
     async def async_discover(self) -> None:
         """Enumerate populated groups and read the channel layout.
@@ -459,20 +469,15 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                         muted=muted,
                     )
                     return
-                if zone is None:
-                    # The amp is on and nothing says whether this zone is: the
-                    # status page is down and the last reading has expired. It
-                    # may be playing, and a zone-on may reset it.
-                    raise HomeAssistantError(
-                        translation_domain=DOMAIN,
-                        translation_key="zone_power_unknown",
-                        translation_placeholders={"zone": GROUP_LETTERS[group]},
-                    )
+                # Power unknown (status page down past the carry-forward): switch
+                # it on anyway. A zone-on to a zone already on does nothing --
+                # no turn-on volume, no mute change (measured 2026-09-27) -- so
+                # this is safe either way.
 
             if not amp_on:
                 self._check_wake_holdoff()
             # Read before any wake: an off zone reports its level in standby
-            # too, and whether a wake leaves zone volumes alone is unmeasured.
+            # too, and a zone a wake revives takes its turn-on volume.
             level = await self._async_level_to_restore(group, ceiling_db)
             known_off: set[int] = set()
             if not amp_on:
@@ -493,7 +498,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
             restore = self._mute_to_restore(group, await self.client.get_mute(group))
             held = self._held_level.get(group)
             if not restore:
-                self._held_level.pop(group, None)
+                self._drop_hold(group)
             elif held is not None:
                 # Held while off: the amp's own level may be the silent turn-on
                 # volume from an earlier muted switch-on, or older than a level
@@ -570,13 +575,13 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
             for other in known_off:
                 power[other] = False
         if restore:
-            self._mute_owed.discard(group)
+            self._settle_mute(group)
         if restore:
             # Muted: leave it at the silent turn-on level and hold its own. A
             # volume sent now would un-mute it.
             self._apply_power(group, zone_on=True, amp_on=True, power=power, muted=True)
             if level is not None:
-                self._held_level[group] = level
+                self._set_hold(group, level)
                 self.apply_optimistic(group, volume_db=level)
             else:
                 self._volume_unverified.add(group)
@@ -646,7 +651,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                     if muted is not False:
                         # Muted meanwhile, from outside Home Assistant: a volume
                         # sent now would un-mute it. Hold it instead.
-                        self._held_level[group] = level
+                        self._set_hold(group, level)
                         self.apply_optimistic(group, muted=muted)
                         return level
                     await self.client.set_volume(group, level)
@@ -682,7 +687,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         if restore:
             zone_on, muted = await self._async_force_silent(group)
             if muted is True and level is not None:
-                self._held_level[group] = level
+                self._set_hold(group, level)
                 self.apply_optimistic(group, volume_db=level)
             else:
                 self._volume_unverified.add(group)
@@ -748,7 +753,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         Either way the mute is recorded as owed until it is known to be back.
         """
         letter = GROUP_LETTERS[group]
-        self._mute_owed.add(group)
+        self._owe_mute(group)
         try:
             await self.client.set_mute(group, True)
             await self._async_verify_mute(group, after_wake=False)
@@ -758,7 +763,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
             _LOGGER.warning(
                 "Switching zone %s on failed part-way; it has been muted", letter
             )
-            self._mute_owed.discard(group)
+            self._settle_mute(group)
             return None, True
         try:
             await self.client.set_group_power(group, False)
@@ -811,7 +816,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         if await self._async_read_mute_or_refuse(group):
             self._hold(group, db)
             return
-        self._held_level.pop(group, None)
+        self._drop_hold(group)
         await self.client.set_volume(group, db)
         self.apply_optimistic(group, volume_db=db, muted=False)
 
@@ -830,7 +835,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
             if base is not None:
                 self._hold(group, max(MIN_VOLUME_DB, min(ceiling_db, base + delta)))
             return
-        self._held_level.pop(group, None)
+        self._drop_hold(group)
         current = await client.get_volume(group)
         if current is None:
             if delta < 0:
@@ -879,17 +884,60 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
                 # stays until a poll reads the zone unmuted.
                 self.apply_optimistic(group, muted=None)
             raise
-        self._held_level.pop(group, None)
+        self._drop_hold(group)
         if level is not None:
             self.apply_optimistic(group, muted=False, volume_db=level)
         else:
             self.apply_optimistic(group, muted=False)
 
+    async def async_load_holds(self) -> None:
+        """Bring back held levels and owed mutes from before a restart."""
+        data = await self._store.async_load() or {}
+        try:
+            held = {int(g): int(v) for g, v in (data.get("held_level") or {}).items()}
+            owed = {int(g) for g in data.get("mute_owed") or []}
+        except (AttributeError, TypeError, ValueError):
+            _LOGGER.warning("Ignoring unreadable saved zone state: %s", data)
+            return
+        self._held_level = {
+            g: v
+            for g, v in held.items()
+            if g in self.groups and MIN_VOLUME_DB <= v <= MAX_VOLUME_DB
+        }
+        self._mute_owed = {g for g in owed if g in self.groups}
+
+    def _set_hold(self, group: int, level: int) -> None:
+        self._held_level[group] = level
+        self._save_holds()
+
+    def _drop_hold(self, group: int) -> None:
+        if self._held_level.pop(group, None) is not None:
+            self._save_holds()
+
+    def _owe_mute(self, group: int) -> None:
+        self._mute_owed.add(group)
+        self._save_holds()
+
+    def _settle_mute(self, group: int) -> None:
+        if group in self._mute_owed:
+            self._mute_owed.discard(group)
+            self._save_holds()
+
+    def _save_holds(self) -> None:
+        self._store.async_delay_save(self._holds_data, HOLDS_SAVE_DELAY)
+
+    @callback
+    def _holds_data(self) -> dict:
+        return {
+            "held_level": {str(g): v for g, v in self._held_level.items()},
+            "mute_owed": sorted(self._mute_owed),
+        }
+
     def held_level(self, group: int) -> int | None:
         return self._held_level.get(group)
 
     def _hold(self, group: int, db: int) -> None:
-        self._held_level[group] = db
+        self._set_hold(group, db)
         self.apply_optimistic(group, volume_db=db, muted=True)
 
     async def _async_read_mute_or_refuse(self, group: int) -> bool:
@@ -910,7 +958,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         """The level to show: a hold while confirmed muted, else the amp's."""
         if muted is False:
             # Un-muted, from wherever: the amp's level is the truth.
-            self._held_level.pop(group, None)
+            self._drop_hold(group)
         held = self._held_level.get(group)
         return held if muted is True and held is not None else volume
 
@@ -920,7 +968,7 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
 
     def note_user_mute(self, group: int) -> None:
         """The user set the mute themselves, so none is owed any more."""
-        self._mute_owed.discard(group)
+        self._settle_mute(group)
 
     def _mute_to_restore(self, group: int, was_muted: bool | None) -> bool:
         """Whether to mute a zone after switching it on.
@@ -1317,3 +1365,8 @@ class SonanceCoordinator(DataUpdateCoordinator[SonanceData]):
         except TimeoutError:
             _LOGGER.warning("A power change was still running at unload")
         await self.client.disconnect()
+
+
+async def async_remove_holds(hass: HomeAssistant, entry: SonanceConfigEntry) -> None:
+    """Delete an entry's saved zone state along with the entry."""
+    await Store(hass, 1, holds_store_key(entry.entry_id)).async_remove()
