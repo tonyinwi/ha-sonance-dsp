@@ -185,11 +185,14 @@ including what was not measured.
   volume change un-mutes a zone on this amp, so its level is held instead (below).
 - **A muted zone is never sent a volume.** Any volume change un-mutes a zone, even an off
   one ([protocol](protocol.md#power-measured-in-power-button-mode)), so while a zone is
-  muted -- or its mute cannot be read -- volume changes from HA are held and shown, not
-  sent, and unmuting applies the held level: the volume set is itself the unmute. A zone
-  switched on muted keeps its silent turn-on level with its own level held. A zone
-  un-muted outside HA drops its hold; the amp's level is then the truth. Holds are in
-  memory, so a restart loses them and the zone keeps the level the amp reports.
+  muted, volume changes from HA are held and shown, not sent, and unmuting applies the
+  held level: the volume set is itself the unmute. If the mute cannot be read (asked
+  twice) the change is refused with an error rather than guessed. A zone switched on
+  muted keeps its silent turn-on level with its own level held, and a hold survives off/on
+  cycles; the restore after an unmuted switch-on re-reads the mute before each write. A
+  failed unmute shows the mute as unknown, never "muted". A zone un-muted outside HA
+  drops its hold. Holds are in memory, so a restart loses them and the zone keeps the
+  level the amp reports.
 - **Switching on restores the mute, and checks it stuck.** The mute is read while the zone
   is off (it keeps it there) and sent straight after the zone-on, both frames under one
   hold of the protocol lock. It is read back at 0.3, 0.6, 1.0 and 1.5 s (to 5 s after a
@@ -265,6 +268,10 @@ including what was not measured.
 
 Known limits, each needing an unmeasured behaviour or an unlikely combination:
 
+- **"On but muted" in a scene plays briefly.** HA reproduces a scene as `turn_on`, then
+  `volume_set`, then `volume_mute`, so a zone that starts off and unmuted comes on
+  audibly before the mute arrives. Use a script: `volume_mute` first -- a mute sent to an
+  off zone sticks -- then `turn_on`.
 - **A scene passes through the zone's old level.** HA reproduces a scene as `turn_on` then
   `volume_set`, so a zone plays briefly at its restored level before the scene's own. In a
   script, call `volume_set` before `turn_on`: the restore reads the off zone's level.

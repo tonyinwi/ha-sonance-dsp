@@ -262,6 +262,7 @@ class FakeAmp:
             return
         self.volume[group] = db
         self.mute[group] = False  # measured: ANY volume change un-mutes
+        self._no_echo(entry)
 
     async def volume_up(self, group: int) -> None:
         self._tick(f"vol{group}:up")
@@ -2432,10 +2433,24 @@ async def test_a_volume_set_on_an_unmuted_zone_is_sent(hass: HomeAssistant) -> N
     assert c.held_level(0) is None
 
 
-async def test_a_volume_set_whose_mute_cannot_be_read_is_held(
+async def test_a_volume_set_whose_mute_cannot_be_read_is_refused(
     hass: HomeAssistant,
 ) -> None:
-    """Unknown is treated as muted: silent is one tap to fix."""
+    """Not sent (it would un-mute), and not reported as done either."""
+    amp = FakeAmp()
+    c = make(hass, amp)
+    amp.unanswered_mute = 2
+    z = zone(c, hass)
+
+    with pytest.raises(HomeAssistantError) as err:
+        await z.async_set_volume_level(0.5)
+
+    assert err.value.translation_key == "mute_unknown"
+    assert not any(e.startswith("vol0:") for e in amp.log)
+    assert c.held_level(0) is None
+
+
+async def test_one_unanswered_mute_read_is_asked_again(hass: HomeAssistant) -> None:
     amp = FakeAmp()
     c = make(hass, amp)
     amp.unanswered_mute = 1
@@ -2443,7 +2458,20 @@ async def test_a_volume_set_whose_mute_cannot_be_read_is_held(
 
     await z.async_set_volume_level(0.5)
 
-    assert not any(e.startswith("vol0:") for e in amp.log)
+    assert amp.volume[0] == -35
+
+
+async def test_a_hold_records_the_mute_it_read(hass: HomeAssistant) -> None:
+    """Muted at a keypad since the last poll: HA must show it muted."""
+    amp = FakeAmp()
+    amp.mute[0] = True
+    c = make(hass, amp)
+    c.data.groups[0] = replace(c.data.groups[0], muted=False)  # stale
+    z = zone(c, hass)
+
+    await z.async_set_volume_level(0.5)
+
+    assert c.data.groups[0].muted is True
     assert c.held_level(0) == -35
 
 
@@ -2547,3 +2575,180 @@ async def test_a_zone_unmuted_outside_ha_drops_its_hold(hass: HomeAssistant) -> 
 
     assert c.held_level(0) is None
     assert c.data.groups[0].volume_db == -70
+
+
+# ---------------------------------------------------------------------------
+# Holds across switch-ons, failures and polls (review of 0.3.3)
+# ---------------------------------------------------------------------------
+
+
+async def test_a_hold_survives_an_off_on_cycle(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    amp.turn_on_volume = -70
+    amp.group_power[0] = False
+    amp.volume[0] = -35
+    amp.mute[0] = True
+    c = make(hass, amp)
+    await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
+    await c.async_turn_off(0)
+
+    await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
+
+    assert c.held_level(0) == -35
+    await zone(c, hass).async_mute_volume(False)
+    assert amp.volume[0] == -35
+    assert amp.mute[0] is False
+
+
+async def test_a_level_held_while_off_is_used_at_switch_on(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    amp.group_power[0] = False
+    amp.volume[0] = -20
+    amp.mute[0] = True
+    c = make(hass, amp)
+    await zone(c, hass).async_set_volume_level(0.5)  # -35, held: muted
+    assert c.held_level(0) == -35
+
+    await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
+
+    assert c.held_level(0) == -35
+
+
+async def test_an_unmuted_switch_on_drops_a_stale_hold(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    amp.group_power[0] = False
+    amp.volume[0] = -20
+    c = make(hass, amp)
+    c._held_level[0] = -35
+
+    await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
+
+    assert c.held_level(0) is None
+    assert amp.volume[0] == -20
+
+
+@pytest.mark.parametrize(
+    ("fault", "shown_muted"),
+    [
+        ("volume_echo_lost", None),
+        ("unmute_not_sent", None),
+        ("volume_not_sent", True),
+    ],
+)
+async def test_a_failed_unmute_is_honest(
+    hass: HomeAssistant, fault: str, shown_muted: bool | None
+) -> None:
+    """Never "muted" while it may be playing; the hold stays until a poll says."""
+    amp = FakeAmp()
+    amp.mute[0] = True
+    c = make(hass, amp)
+    c._held_level[0] = -35
+    c.data.groups[0] = replace(c.data.groups[0], muted=True)
+    if fault == "volume_echo_lost":
+        amp.lose_echo_next("vol0:-35")
+    elif fault == "unmute_not_sent":
+        amp.not_sent_next("mute0:off")
+    else:
+        amp.not_sent_next("vol0:-35")
+
+    with pytest.raises(HomeAssistantError):
+        await zone(c, hass).async_mute_volume(False)
+
+    assert c.data.groups[0].muted is shown_muted
+    assert c.held_level(0) == -35
+
+
+async def test_the_restore_holds_if_the_zone_was_muted_meanwhile(
+    hass: HomeAssistant,
+) -> None:
+    """A keypad mute after the power-up window: the restore must not undo it."""
+    amp = FakeAmp()
+    amp.turn_on_volume = -70
+    amp.group_power[0] = False
+    amp.volume[0] = -35
+    c = make(hass, amp)
+
+    async def power_up_then_keypad_mute() -> None:
+        amp.settle()
+        amp.mute[0] = True
+
+    c._async_wait_for_power_up = power_up_then_keypad_mute
+    await c.async_turn_on(0, ceiling_db=0)
+
+    assert amp.mute[0] is True
+    assert not any(e.startswith("vol0:") for e in amp.log)
+    assert c.held_level(0) == -35
+    assert c.data.groups[0].muted is True
+
+
+async def test_the_fail_safe_holds_the_level(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    amp.turn_on_volume = -70
+    amp.group_power[0] = False
+    amp.volume[0] = -35
+    amp.mute[0] = True
+    amp.lose_echo_next("group0:on")
+    c = make(hass, amp)
+
+    with pytest.raises(SonanceConnectionError):
+        await c.async_turn_on(0, ceiling_db=0)
+    amp.settle()
+
+    assert amp.mute[0] is True
+    assert c.held_level(0) == -35
+    assert c.data.groups[0].volume_db == -35
+
+
+async def test_the_already_on_path_shows_the_hold(hass: HomeAssistant) -> None:
+    amp = FakeAmp()
+    amp.mute[0] = True
+    amp.volume[0] = -70
+    c = make(hass, amp)
+    c._held_level[0] = -35
+
+    await c.async_turn_on(0, ceiling_db=0)
+
+    assert c.data.groups[0].volume_db == -35
+
+
+async def test_a_poll_with_the_mute_unknown_shows_the_amps_level(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp()
+    amp.volume[0] = -20
+    c = make(hass, amp)
+    c._held_level[0] = -35
+    real = amp.read_group
+
+    async def read_group(group: int) -> GroupState:
+        state = await real(group)
+        return replace(state, muted=None) if group == 0 else state
+
+    c.client.read_group = read_group
+    c.data = await c._async_update_data()
+
+    assert c.data.groups[0].volume_db == -20
+    assert c.held_level(0) == -35
+
+
+async def test_a_poll_does_not_make_an_unanswered_group_look_answered(
+    hass: HomeAssistant,
+) -> None:
+    amp = FakeAmp()
+    amp.mute[0] = True
+    c = make(hass, amp)
+    c._held_level[0] = -35
+    real = amp.read_group
+
+    async def read_group(group: int) -> GroupState:
+        state = await real(group)
+        return replace(state, volume_db=None) if group == 0 else state
+
+    c.client.read_group = read_group
+    c.data = await c._async_update_data()
+
+    assert c.data.groups[0].volume_db is None
