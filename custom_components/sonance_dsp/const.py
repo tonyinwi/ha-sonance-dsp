@@ -155,6 +155,75 @@ RE_MUTE: Final = re.compile(r",\s*Group:([A-H])\s+Mute=(on|off)", re.IGNORECASE)
 RE_SOURCE: Final = re.compile(r",\s*Group:([A-H])\s+Src(\d)=(.+?)\s*$", re.IGNORECASE)
 RE_AMP_POWER: Final = re.compile(r"Power\s+status\s*:\s*(\w+)")
 
+# Echoes of the writes whose acknowledgement matters, as recorded from the
+# device on 2026-09-26: "Cmd:GroupON      ,Group:A", "Cmd:MuteOn      , Group:A",
+# "Cmd:PowerOn". A write is acknowledged by ITS echo, not by any 50 bytes: a
+# frame of NUL padding, or another group's late reply, is not an answer --
+# and with the status page down, the echo is the only confirmation there is.
+RE_GROUP_POWER_ECHO: Final = re.compile(
+    r"Cmd:\s*Group(ON|OFF)\s*,\s*Group:([A-H])", re.IGNORECASE
+)
+RE_MUTE_ECHO: Final = re.compile(
+    r"Cmd:\s*Mute(ON|OFF)\s*,\s*Group:([A-H])", re.IGNORECASE
+)
+RE_AMP_POWER_ECHO: Final = re.compile(r"Cmd:\s*Power(ON|OFF)\b", re.IGNORECASE)
+
+# --- Power ------------------------------------------------------------------
+# Measured on the device in Power Button mode (2026-09-26) unless marked.
+#
+# Waking from standby took 10.6 s (the manual says 9-12). Mute writes sent
+# during that window were lost even though they echoed success; zone-on writes
+# sent in the same window were applied. The cause was not established, so the
+# policy is the conservative one: nothing but a status query until the
+# amplifier reports On.
+WAKE_TIMEOUT: Final = 25.0
+WAKE_POLL_INTERVAL: Final = 0.5
+# Amplifier-power queries before its state is declared unknown. A single late
+# reply is routine; three in a row is not, and a power change made on a guess
+# about whether the amp is awake is how zones nobody asked for start playing.
+AMP_POWER_READ_ATTEMPTS: Final = 3
+AMP_POWER_READ_INTERVAL: Final = 0.5
+# After switching a muted zone on, its mute is read back at these intervals
+# (cumulative 0.3, 0.6, 1.0, 1.5 s) and re-sent whenever it reads off.
+# Switching a zone on clears its mute; the clear was visible at the first
+# sample, about 0.5 s after the zone-on. Whether a mute sent within one round
+# trip of the zone-on survives that clear was NOT measured -- the probe that
+# seemed to show it waited 0.5 s per command -- so the restore is verified
+# rather than trusted.
+MUTE_VERIFY_DELAYS: Final = (0.3, 0.3, 0.4, 0.5)
+# Straight after a wake the window runs to 5 s. Mute writes sent during a boot
+# were lost while zone-on writes were kept, which fits the clear landing when a
+# zone actually powers up -- and just after "On", that may be later.
+MUTE_VERIFY_DELAYS_AFTER_WAKE: Final = (*MUTE_VERIFY_DELAYS, 1.5, 2.0)
+# How long unload waits for a power change in progress before disconnecting.
+# Cutting one off mid-wake leaves the zones a wake revived playing.
+CLOSE_WAIT: Final = WAKE_TIMEOUT + 15
+# After a poll fails outright, the next one comes this soon rather than a
+# whole interval later: an unavailable entity ignores turn_off.
+POLL_RETRY_AFTER: Final = 5.0
+# A wake that timed out is not retried for this long. Without it a scene
+# switching four zones on against an amplifier that will not wake spends
+# four full timeouts -- over a minute and a half -- with every zone command
+# queued behind it. Any poll that finds the amplifier On clears it early.
+WAKE_RETRY_HOLDOFF: Final = 60.0
+# The HTTP status page reflected a group power change within 0.01-0.06 s, so
+# a few seconds is generous for confirming it.
+POWER_CONFIRM_TIMEOUT: Final = 3.0
+POWER_CONFIRM_INTERVAL: Final = 0.2
+# How long zone power last read from the status page is still shown once the
+# page stops answering, or three poll intervals if that is longer. Without it
+# one failed HTTP read turns every zone "unknown", which HomeKit shows as off
+# and media_player.toggle answers by switching the zone OFF. Bounded, because a
+# zone switched from the amp's own web UI during a long outage would otherwise
+# show a stale state forever.
+GROUP_POWER_STALE_AFTER: Final = 300.0
+# Consecutive unanswered amplifier-power queries bridged with the last answer
+# -- but only an "on" answer. A single late reply is routine and should not
+# flicker every zone to unknown. A cached "standby" is NOT bridged: if the amp
+# was woken from outside Home Assistant in between, bridging it would show
+# zones OFF while they play. Unknown is the honest answer there.
+AMP_POWER_MISSES_BRIDGED: Final = 2
+
 # --- Config entry / options ------------------------------------------------
 CONF_MAX_DB: Final = "max_db"
 # Maps a source number ("1".."4") to an upstream media_player entity_id. The

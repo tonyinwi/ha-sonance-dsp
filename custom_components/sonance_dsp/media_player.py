@@ -96,6 +96,8 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
         | MediaPlayerEntityFeature.VOLUME_STEP
         | MediaPlayerEntityFeature.VOLUME_MUTE
         | MediaPlayerEntityFeature.SELECT_SOURCE
+        | MediaPlayerEntityFeature.TURN_ON
+        | MediaPlayerEntityFeature.TURN_OFF
     )
 
     def __init__(
@@ -150,16 +152,36 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
     def _state(self) -> GroupState | None:
         return self.coordinator.data.groups.get(self._group)
 
+    def _powered(self) -> bool | None:
+        """Is this zone actually producing output?
+
+        Needs BOTH the amplifier and the zone on. A zone's on/off flag survives
+        standby -- the status page reports a zone "on" while the whole amp is
+        asleep -- so the zone flag alone would show a silent zone as on.
+
+        None when it cannot be known: the status page, the only source of
+        zone power, did not answer, or the zone's flag is on but the amp's own
+        power is unknown. A zone that answers queries is not thereby on; a
+        switched-off zone still reports volume and mute.
+        """
+        data = self.coordinator.data
+        if data.amp_power is False:
+            return False
+        zone = data.group_power.get(self._group)
+        if not zone:
+            return zone
+        return True if data.amp_power else None
+
     @property
     def state(self) -> MediaPlayerState | None:
-        """ON when the zone answered, or the linked player's transport state.
-
-        Group power is deliberately not used: the amplifier has no group-power
-        query over TCP and no TURN_ON is declared, so rendering a zone OFF would
-        strip its controls and leave no way to turn it back on.
-        """
+        """OFF, ON, or the linked player's transport state while on."""
         state = self._state
         if state is None or not state.answered:
+            return None
+        powered = self._powered()
+        if powered is False:
+            return MediaPlayerState.OFF
+        if powered is None:
             return None
         upstream = self._linked_state()
         if upstream is not None:
@@ -171,8 +193,20 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
 
     @property
     def volume_level(self) -> float | None:
+        # None while the zone is off, or while its cached level may predate its
+        # last switch-on. HA hides it from an off entity's state anyway, but
+        # Assist's percentage step reads this property directly -- "turn it up
+        # 10 percent" said while the zone is still waking would otherwise add
+        # 10% to the volume from BEFORE the switch-on and land it after,
+        # jumping the zone by however far the turn-on volume is from it. With
+        # None, HA's handler fails with an error instead.
         state = self._state
-        if state is None or state.volume_db is None:
+        if (
+            state is None
+            or state.volume_db is None
+            or self._powered() is False
+            or not self.coordinator.volume_verified(self._group)
+        ):
             return None
         return self._to_level(state.volume_db)
 
@@ -216,8 +250,9 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
                     "sources": ", ".join(self.source_list) or "none",
                 },
             )
-        await self.coordinator.client.set_source(self._group, number)
-        self.coordinator.apply_optimistic(self._group, source_name=source)
+        async with self.coordinator.command_lock:
+            await self.coordinator.client.set_source(self._group, number)
+            self.coordinator.apply_optimistic(self._group, source_name=source)
 
     # --- linked upstream player -------------------------------------------
 
@@ -232,7 +267,11 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
         return self._input_links.get(str(number))
 
     def _linked_state(self):
-        if self._linked_entity_id is None:
+        # A switched-off zone is not playing its source, so it must not show
+        # the source's track or report "playing".
+        # Nor may one whose power is unknown: that is exactly the case of a
+        # zone whose flag survived standby while the amp sleeps.
+        if self._linked_entity_id is None or self._powered() is not True:
             return None
         return self.hass.states.get(self._linked_entity_id)
 
@@ -339,6 +378,9 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
         power = self.coordinator.data.group_power.get(self._group)
         if power is not None:
             attrs["group_power"] = "on" if power else "off"
+        amp = self.coordinator.data.amp_power
+        if amp is not None:
+            attrs["amp_power"] = "on" if amp else "standby"
         return attrs
 
     # --- commands ----------------------------------------------------------
@@ -348,12 +390,33 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
     # the length of a poll (PARALLEL_UPDATES = 1), and the coordinator's
     # refresh debounce makes a dragged slider visibly snap back to its old
     # value first. The next scheduled poll reconciles.
+    #
+    # Each write also holds the coordinator's command lock, so one sent while
+    # a zone is being switched on waits for it rather than reaching a booting
+    # amplifier, which drops it while echoing success. PARALLEL_UPDATES alone
+    # does not cover this: Assist's relative-volume intent calls these methods
+    # directly rather than through a service call.
+
+    @command
+    async def async_turn_on(self) -> None:
+        """Switch the zone on, waking the amp first if it is in standby.
+
+        From standby this takes about ten seconds: commands sent while the amp
+        boots are dropped, so nothing else can be sent until it has finished.
+        """
+        await self.coordinator.async_turn_on(self._group)
+
+    @command
+    async def async_turn_off(self) -> None:
+        """Switch the zone off, and the amp to standby if it was the last one."""
+        await self.coordinator.async_turn_off(self._group)
 
     @command
     async def async_set_volume_level(self, volume: float) -> None:
         db = self._to_db(volume)
-        await self.coordinator.client.set_volume(self._group, db)
-        self.coordinator.apply_optimistic(self._group, volume_db=db)
+        async with self.coordinator.command_lock:
+            await self.coordinator.client.set_volume(self._group, db)
+            self.coordinator.apply_optimistic(self._group, volume_db=db)
 
     @command
     async def async_volume_up(self) -> None:
@@ -370,24 +433,39 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
         enforced by the same mapping as the slider. Falls back to the device's
         own relative command when it is not -- better a step against an unknown
         baseline than no response to a button press.
+
+        The baseline is read from the amplifier, inside the lock, not taken
+        from the cache. A cached level can be stale -- a switch-on applies the
+        zone's turn-on volume, and one late reply to its read-back leaves the
+        old level cached -- and a step computed from a stale level is not a
+        step but a jump, as far as the stale level is from the real one.
         """
-        state = self._state
-        if state is None or state.volume_db is None:
+        async with self.coordinator.command_lock:
             client = self.coordinator.client
-            if delta > 0:
+            current = await client.get_volume(self._group)
+            if current is None:
+                if delta < 0:
+                    await client.volume_down(self._group)
+                    return
+                # Up against an unread level: the device's own step, unless the
+                # last known level is already at the ceiling it would cross.
+                state = self._state
+                if (
+                    state is not None
+                    and state.volume_db is not None
+                    and state.volume_db >= self._effective_max_db
+                ):
+                    return
                 await client.volume_up(self._group)
-            else:
-                await client.volume_down(self._group)
-            return
-        target = max(
-            MIN_VOLUME_DB, min(self._effective_max_db, state.volume_db + delta)
-        )
-        if target == state.volume_db:
-            return
-        await self.coordinator.client.set_volume(self._group, target)
-        self.coordinator.apply_optimistic(self._group, volume_db=target)
+                return
+            target = max(MIN_VOLUME_DB, min(self._effective_max_db, current + delta))
+            if target != current:
+                await client.set_volume(self._group, target)
+            self.coordinator.apply_optimistic(self._group, volume_db=target)
 
     @command
     async def async_mute_volume(self, mute: bool) -> None:
-        await self.coordinator.client.set_mute(self._group, mute)
-        self.coordinator.apply_optimistic(self._group, muted=mute)
+        async with self.coordinator.command_lock:
+            await self.coordinator.client.set_mute(self._group, mute)
+            self.coordinator.note_user_mute(self._group)
+            self.coordinator.apply_optimistic(self._group, muted=mute)

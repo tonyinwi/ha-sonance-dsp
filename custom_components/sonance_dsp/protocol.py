@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass
 
 from .const import (
@@ -54,7 +55,10 @@ from .const import (
     OP_VOLUME_DOWN,
     OP_VOLUME_UP,
     RE_AMP_POWER,
+    RE_AMP_POWER_ECHO,
+    RE_GROUP_POWER_ECHO,
     RE_MUTE,
+    RE_MUTE_ECHO,
     RE_SOURCE,
     RE_VOLUME,
     REPLY_LENGTH,
@@ -83,6 +87,15 @@ class SonanceError(Exception):
 
 class SonanceConnectionError(SonanceError):
     """The connection failed, was lost, or the reply stream lost alignment."""
+
+
+class SonanceNotSentError(SonanceConnectionError):
+    """The command never reached the amplifier: there was no connection to send it on.
+
+    Distinct because it is the one failure that proves the command had no
+    effect. Every other failure after a write -- a lost or late echo -- leaves
+    open that the amplifier applied it.
+    """
 
 
 class ForbiddenOpcodeError(SonanceError):
@@ -165,7 +178,7 @@ class SonanceProtocol:
                 reader, writer = await asyncio.open_connection(self._host, self._port)
         except (TimeoutError, OSError) as err:
             self._reader = self._writer = None
-            raise SonanceConnectionError(
+            raise SonanceNotSentError(
                 f"Could not connect to {self._host}:{self._port}: {err}"
             ) from err
 
@@ -182,7 +195,7 @@ class SonanceProtocol:
         # until Home Assistant restarts.
         if self._closed:
             writer.close()
-            raise SonanceConnectionError(
+            raise SonanceNotSentError(
                 "Connection was closed while connecting; discarding the new socket"
             )
 
@@ -272,41 +285,61 @@ class SonanceProtocol:
         """
         frame = self.build_frame(opcode, operand)
         async with self._lock:
-            if self._closed:
-                raise SonanceConnectionError("Connection has been closed")
-            if not self._connected:
-                await self._connect_locked()
-            assert self._reader is not None and self._writer is not None
-            try:
-                self._writer.write(frame)
-                await self._writer.drain()
-                async with asyncio.timeout(timeout):
-                    raw = await self._reader.readexactly(REPLY_LENGTH)
-                if drain_after:
-                    await self._discard_padding()
-            except TimeoutError:
-                # NB TimeoutError is an OSError subclass, so this clause must
-                # stay above the OSError one.
-                if tolerate_silence:
-                    return None
-                self._abort()
-                if require_reply:
-                    raise SonanceConnectionError(
-                        f"No reply to opcode 0x{opcode:02X}; command not acknowledged"
-                    ) from None
+            return await self._exchange_locked(
+                frame,
+                opcode,
+                timeout=timeout,
+                require_reply=require_reply,
+                tolerate_silence=tolerate_silence,
+                drain_after=drain_after,
+            )
+
+    async def _exchange_locked(
+        self,
+        frame: bytes,
+        opcode: int,
+        *,
+        timeout: float = REPLY_TIMEOUT,
+        require_reply: bool = True,
+        tolerate_silence: bool = False,
+        drain_after: bool = False,
+    ) -> str | None:
+        """Send one frame and read its reply. Caller must hold the lock."""
+        if self._closed:
+            raise SonanceNotSentError("Connection has been closed")
+        if not self._connected:
+            await self._connect_locked()
+        assert self._reader is not None and self._writer is not None
+        try:
+            self._writer.write(frame)
+            await self._writer.drain()
+            async with asyncio.timeout(timeout):
+                raw = await self._reader.readexactly(REPLY_LENGTH)
+            if drain_after:
+                await self._discard_padding()
+        except TimeoutError:
+            # NB TimeoutError is an OSError subclass, so this clause must
+            # stay above the OSError one.
+            if tolerate_silence:
                 return None
-            except (OSError, asyncio.IncompleteReadError) as err:
-                self._abort()
-                raise SonanceConnectionError(f"Connection lost: {err}") from err
-            except BaseException:
-                # Cancellation from outside -- HA cancelling a coordinator
-                # refresh on reload, or a script stopped mid service call.
-                # asyncio.timeout only converts a cancel into TimeoutError when
-                # its OWN deadline fired, so this path is reached with a reply
-                # still on the wire. Leaving the socket open would hand that
-                # reply to the next command.
-                self._abort()
-                raise
+            self._abort()
+            if require_reply:
+                raise SonanceConnectionError(
+                    f"No reply to opcode 0x{opcode:02X}; command not acknowledged"
+                ) from None
+            return None
+        except (OSError, asyncio.IncompleteReadError) as err:
+            self._abort()
+            raise SonanceConnectionError(f"Connection lost: {err}") from err
+        except BaseException:
+            # Cancellation from outside -- HA cancelling a coordinator
+            # refresh on reload, or a script stopped mid service call.
+            # asyncio.timeout only converts a cancel into TimeoutError when
+            # its OWN deadline fired, so this path is reached with a reply
+            # still on the wire. Leaving the socket open would hand that
+            # reply to the next command.
+            self._abort()
+            raise
 
         text = _strip(raw)
         # A group with no channels can answer with 50 NUL bytes rather than
@@ -428,7 +461,8 @@ class SonanceProtocol:
         return match.group(2).lower() == "on"
 
     async def set_mute(self, group: int, mute: bool) -> None:
-        await self._request(OP_MUTE_ON if mute else OP_MUTE_OFF, group)
+        reply = await self._request(OP_MUTE_ON if mute else OP_MUTE_OFF, group)
+        self._check_echo(RE_MUTE_ECHO, reply, "ON" if mute else "OFF", group)
 
     # --- source ------------------------------------------------------------
 
@@ -477,16 +511,75 @@ class SonanceProtocol:
         if reply is None:
             return None
         match = RE_AMP_POWER.search(reply)
-        if not match:
+        word = match.group(1).lower() if match else None
+        if word not in ("on", "off"):
+            # Only "On" and "Off" have been seen. Anything else is unknown, not
+            # standby: reading it as standby would show playing zones OFF.
             self._unparsed("amplifier power", None, reply)
             return None
-        return match.group(1).lower() == "on"
+        return word == "on"
 
     async def set_amp_power(self, on: bool) -> None:
-        await self._request(OP_AMP_POWER_ON if on else OP_AMP_POWER_OFF, None)
+        reply = await self._request(OP_AMP_POWER_ON if on else OP_AMP_POWER_OFF, None)
+        self._check_echo(RE_AMP_POWER_ECHO, reply, "ON" if on else "OFF", None)
 
     async def set_group_power(self, group: int, on: bool) -> None:
-        await self._request(OP_GROUP_ON if on else OP_GROUP_OFF, group)
+        reply = await self._request(OP_GROUP_ON if on else OP_GROUP_OFF, group)
+        self._check_echo(RE_GROUP_POWER_ECHO, reply, "ON" if on else "OFF", group)
+
+    async def set_group_power_muted(self, group: int) -> None:
+        """Switch a group on and mute it, with nothing sent in between.
+
+        Switching a zone on clears its mute, so a muted zone is switched on
+        with its mute restored straight after. Sending both under one hold of
+        the lock means no other request -- a poll's query, say -- can queue
+        between them, and a late reply to that request cannot delay the
+        restore by a whole reply timeout while the zone plays.
+
+        The mute is sent even when the zone-on goes unacknowledged: a late echo
+        does not mean the zone-on was not applied, and muting a zone that is
+        still off costs nothing. The zone-on's error is raised afterwards.
+        """
+        on_frame = self.build_frame(OP_GROUP_ON, group)
+        mute_frame = self.build_frame(OP_MUTE_ON, group)
+        async with self._lock:
+            error: SonanceError | None = None
+            try:
+                reply = await self._exchange_locked(on_frame, OP_GROUP_ON)
+                self._check_echo(RE_GROUP_POWER_ECHO, reply, "ON", group)
+            except SonanceNotSentError:
+                # Nothing reached the amplifier, so there is no zone-on to
+                # follow -- and the mute would only wait out another connect.
+                raise
+            except SonanceError as err:
+                error = err
+            reply = await self._exchange_locked(mute_frame, OP_MUTE_ON)
+            self._check_echo(RE_MUTE_ECHO, reply, "ON", group)
+            if error is not None:
+                raise error
+
+    def _check_echo(
+        self, pattern: re.Pattern[str], reply: str | None, state: str, group: int | None
+    ) -> None:
+        """Insist that a write was answered by its own echo.
+
+        Anything else means the reply stream is not where it should be -- the
+        socket is reset, as for any desync, and the write is reported as not
+        acknowledged.
+        """
+        match = pattern.search(reply or "")
+        if (
+            match is not None
+            and match.group(1).upper() == state
+            and (group is None or match.group(2).upper() == GROUP_LETTERS[group])
+        ):
+            return
+        self._abort()
+        raise SonanceConnectionError(
+            f"Unexpected reply to a {state.lower()} command"
+            + (f" for group {GROUP_LETTERS[group]}" if group is not None else "")
+            + f": {reply!r}"
+        )
 
     # --- discovery ---------------------------------------------------------
 

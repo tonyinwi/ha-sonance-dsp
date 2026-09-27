@@ -186,9 +186,15 @@ class SonanceHttpApi:
                 resp.raise_for_status()
                 # The amplifier serves JSON as text/html, so content_type must
                 # not be enforced here.
-                return await resp.json(content_type=None)
+                data = await resp.json(content_type=None)
         except (aiohttp.ClientError, TimeoutError, ValueError) as err:
             raise SonanceHttpError(f"Could not read {page}: {err}") from err
+        # aiohttp returns None for an empty body rather than raising. An empty
+        # or non-object answer is a page that did not answer, not one that
+        # answered "nothing is on".
+        if not isinstance(data, dict):
+            raise SonanceHttpError(f"{page} did not return a JSON object")
+        return data
 
     async def identity(self) -> AmplifierIdentity:
         """Read serial, name, model and firmware."""
@@ -209,14 +215,31 @@ class SonanceHttpApi:
         The TCP protocol has no group-power query at all, so this endpoint is
         the only source for it.
         """
-        data = await self._read(HTTP_PAGE_STATUS)
-        states = data.get("power-status") or []
-        return {i: str(v).lower() == "on" for i, v in enumerate(states)}
+        return await self._status_flags("power-status")
 
     async def group_mute(self) -> dict[int, bool]:
+        return await self._status_flags("mute-volumes")
+
+    async def _status_flags(self, key: str) -> dict[int, bool]:
+        """One per-group on/off list from the status page.
+
+        A reply without the list, or with an empty one, raises rather than
+        returning an empty map. An empty map reads as "no zone is on", and
+        switching the last zone off on that basis puts the amplifier in standby
+        under zones that are playing. A page that answered with something else
+        has not said that every zone is off.
+        """
         data = await self._read(HTTP_PAGE_STATUS)
-        states = data.get("mute-volumes") or []
-        return {i: str(v).lower() == "on" for i, v in enumerate(states)}
+        states = data.get(key)
+        if not isinstance(states, list) or not states:
+            raise SonanceHttpError(f"Status page reply has no {key} list")
+        # Only "on" and "off" mean anything. Any other value leaves that group
+        # out -- unknown -- rather than reading it as off.
+        return {
+            i: str(v).lower() == "on"
+            for i, v in enumerate(states)
+            if str(v).lower() in ("on", "off")
+        }
 
     async def topology(self) -> Topology:
         """Read the full channel layout from the In/Out Settings endpoint."""

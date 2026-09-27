@@ -168,20 +168,22 @@ only trustworthy on a settled socket.
 
 Groups can gain and lose channels through the web UI, so this is not a one-time fact.
 
-### The amp-level entity
+### The zone is the player; there is no amp-level entity
 
-One additional `media_player` driving the protocol's global commands, which set every group
-at once.
+An earlier version of this design added an amp-level entity, and then a per-source one,
+both to give Music Assistant a single volume to hold when one streamer feeds several
+zones. Both are dropped. The model now follows how Control4 does room audio: **each zone
+is an independent player**, with its own source, volume, mute and power, and zones that
+share a source share that source's playback the way rooms join a Control4 media session.
 
-This exists for a specific reason. **Music Assistant maps exactly one entity per player to
-a volume control**, but one source device commonly feeds several zones of the same
-amplifier. Without a single entity representing "all of it", MA's volume control has
-nothing coherent to point at. It is also the natural target for "turn the music down"
-by voice.
+That is all expressible in Home Assistant's standard `media_player`, one entity per zone:
+source selection routes the amp, power switches the zone, mirroring shows the source's
+track, and -- still to build -- transport passes through to the source's player and
+`media_player.join` routes zones onto a common source. There is no second kind of entity
+to explain, and nothing whose "volume" is an average of other volumes.
 
-Its state is the **mean of the populated groups' volumes**, because the device has no global
-volume query. That average is a lie whenever zones have been trimmed apart, so the entity
-surfaces an attribute saying so rather than quietly presenting a number nobody set.
+The one physical constraint that survives: **playback belongs to the source, not the
+zone.** Zones on the same streamer share one stream, so pausing in one pauses them all.
 
 ### Feature flags, and why they are not cosmetic
 
@@ -234,9 +236,10 @@ Recorded here rather than left to be rediscovered:
 - **Zone names are read once, at setup.** Renaming a zone in the amplifier's web UI does
   not propagate until the config entry is reloaded, and neither does adding or removing a
   zone. The channel map is only read during discovery.
-- **Group power is visible but not controllable.** It is surfaced as an attribute; there is
-  no `TURN_ON`/`TURN_OFF` yet, so the entity deliberately never renders `OFF` — a zone
-  shown as off with no way to turn it on is a dead tile.
+- **Standby with zones flagged on.** Home Assistant only puts the amplifier in standby when
+  every zone is off, so a wake from HA brings back exactly the zone asked for. If standby
+  came from the front-panel button with zones still on, their flags survive it, and the
+  next wake brings every one of them back, not just the zone requested.
 - **Mute and source reply formats are unverified.** Only the volume and amplifier-power
   literals have been captured from real hardware. The parsers are case-insensitive and log
   a warning with the raw text when a reply arrives but does not match, so a format surprise
@@ -260,14 +263,123 @@ act in the options flow.
 `_attr_volume_step` is derived from the configured range so `volume_up` / `volume_down`
 move exactly one device step rather than Home Assistant's default 10%.
 
-## State the device will not tell you
+## Power
 
-**Group power has no query opcode.** It can be set over TCP and read over HTTP, and that
-asymmetry has to be handled rather than hidden: if the HTTP read is unavailable, group power
-becomes optimistic state and will drift when someone uses the front panel or the web UI.
+Home Assistant owns power. The amplifier's Auto On method is **Power Button** with every
+channel's sleep set to **OFF**, so nothing on the amplifier changes power by itself --
+which is the point. In `Audio` mode it wakes a zone the moment the source plays, and a
+zone accidentally unmuted at 2am plays into the garden.
 
-Where optimistic state is unavoidable, it should be visibly optimistic — refreshed on every
-poll that can refresh it, and never presented as more certain than it is.
+Every rule below is measured behaviour; see *Power* in [`protocol.md`](protocol.md).
+
+- **A zone is on only when the amplifier is on AND the zone is on.** Zone flags survive
+  standby, so either signal alone lies. When either is unknown the state is *unknown*, not
+  `on` -- a switched-off zone still answers volume and mute queries, so answering proves
+  nothing -- and an unknown zone does not mirror its source's track either.
+- **One missed read does not make a zone unknown.** HomeKit shows `unknown` as off, and
+  `media_player.toggle` answers `unknown` by switching the zone *off*. So the last zone
+  power read from the status page is kept for five minutes after the page stops answering
+  (or three poll intervals, if longer), and an "on" answer for the amplifier across up to
+  two unanswered queries. A "standby" answer is *not* carried: if the amp was woken from
+  outside Home Assistant meanwhile, carrying it would show zones OFF while they play.
+  A status page that answers with an empty or malformed body counts as not answering: an
+  empty map reads as "no zone is on", and acting on that would put the amp in standby
+  under zones that are playing.
+- **Turning a zone on restores its mute, and checks it stuck.** Switching a zone on
+  clears its mute. The mute is read from the amplifier while the zone is still off -- it
+  keeps it -- and sent straight after the zone-on, the two frames under one hold of the
+  protocol lock so nothing can queue between them. Whether a mute sent that soon survives
+  the clear is unmeasured, so it is read back at 0.3, 0.6, 1.0 and 1.5 s -- to 5 s straight
+  after a wake, when a zone may power up late -- and anything but a confirmed "muted",
+  including no answer, is met with another mute. It must end on a confirmed read or the
+  switch-on counts as failed (below). If the read before switching on fails, the last
+  polled value is used; if there is none, the zone comes on muted. A zone someone muted
+  stays muted until someone unmutes it.
+- **A switch-on that breaks part-way leaves the zone silent.** If any step after the
+  zone-on fails -- an echo that never arrives, a mute that cannot be confirmed -- the zone
+  is muted again and that is checked the same way; if it still cannot be confirmed the zone
+  is switched off, and muted once more while off. The mute is then *owed*: the next
+  switch-on restores it whatever the amplifier reports, until a restore is confirmed or
+  someone sets the mute themselves. What is shown afterwards is what the status page says,
+  and the mute as unknown when it is. The error is still raised. A zone-on that never left
+  -- no connection to send it on -- is the one failure that proves nothing happened, and it
+  changes nothing. A caller cancelled before anything was switched cancels the request;
+  one cancelled after the zone-on does not stop it, and if it then fails, the log says so.
+- **Turning on a zone that is already on does nothing.** Scenes and
+  `homeassistant.turn_on` call `turn_on` without checking, and whether a zone-on resets a
+  playing zone to its turn-on volume is unmeasured. It is judged from a fresh amplifier
+  read plus the status page, or the last known zone power when the page is down.
+- **Unknown is not guessed.** If the amplifier's own power cannot be read after three
+  tries, nothing is switched: a power-on to an amp already on was never measured. If the
+  amp is on but the zone's power is unknown -- status page down past the carry-forward
+  bound -- the zone is not switched on either: it may be playing, and a zone-on may reset
+  its volume. *This one is a choice, not a necessity.* It blocks turning zones on during a
+  long status-page outage; the alternative is to send the zone-on and accept the unmeasured
+  risk. Measuring a zone-on to a zone already on would settle it.
+- **Waking brings back only the zone asked for.** A wake revives every zone whose flag
+  survived standby -- every zone that was on when something other than Home Assistant
+  put the amp to sleep. They are all shown off while it sleeps, so turning one on must not
+  bring back three: flagged zones, the requested one included, are switched off before the
+  wake and again after it, whatever standby appeared to say. The requested zone's zone-on
+  is then always the measured off-to-on case, which applies its turn-on volume. If standby
+  does not answer a zone-off at all, the rest wait for the wake rather than each waiting
+  out a timeout. A power-on whose echo is lost is waited on anyway, so the clean-up still
+  runs. A revived zone that cannot be switched off is shown as on (or unknown), never off,
+  and the error is raised.
+- **Waking waits for the boot, and so does everything else.** From standby, turn-on sends
+  power-on and then nothing but status queries until the amplifier reports `On` (~10 s).
+  Every write holds the coordinator's command lock for its whole duration, and a power
+  change holds it throughout -- `PARALLEL_UPDATES` alone is not enough, because Assist's
+  relative-volume intent calls entity methods directly. Volume up and down read the
+  current level from the amplifier inside the lock, so a step that waited starts from the
+  turn-on volume, and a stale cache never turns a step into a jump; without a reading, a
+  step up past the ceiling is refused. Assist's *percentage* step computes its target from
+  `volume_level` before it reaches the lock, so a zone that is off -- or whose level has not
+  been read since it was switched on -- reports no `volume_level`, and HA's handler fails
+  with an error instead of jumping. Several zones switched on together share one wake. A
+  wake that times out is not retried for a minute, or until a poll finds the amplifier on,
+  and the holdoff is checked before anything is sent.
+- **The status page is not waited on twice.** Inside a power change each read is bounded
+  at three seconds -- it answers in well under a tenth of one -- and after one failure the
+  rest of that change does without it.
+- **Polls do not overwrite what a command just set.** A poll does not start while a
+  command holds the lock, and one already reading when a change lands discards its own
+  results, which predate it. A skipped poll after a failed one still counts as failed.
+- **One blip does not make a zone ignore turn_off.** Home Assistant silently skips an
+  unavailable entity in a service call, so a poll whose reads fail asks again on a fresh
+  connection before calling the amplifier unreachable, and after an outright failure the
+  next poll comes in five seconds rather than a whole interval.
+- **The last zone off puts the amplifier in standby.** It does not do this itself. A
+  zone-off that gets no answer is checked on the status page -- it may have landed -- and
+  sent once more. Standby is sent whatever the cached state says, since the cache can be
+  stale. When the status page is unreachable there is no knowing whether another zone is
+  still on, so the amplifier is left alone rather than risk silencing it. Turning off a
+  zone in a sleeping amplifier is best effort -- it is already silent -- and what is shown
+  is what the status page then says, or unknown without it.
+- **Power and mute writes are acknowledged by their own echo.** Each is checked against
+  the command and the group it was for, as recorded from the device; a frame of padding or
+  another group's reply is a desync, not an acknowledgement. With the status page down the
+  echo is the only confirmation there is.
+- **Power changes are confirmed on the status page** and the command is retried once.
+- **Unload waits for a power change in progress**, up to the wake timeout plus fifteen
+  seconds, and refuses anything queued behind it. Cutting one off mid-wake would leave the
+  zones the wake revived playing.
+- **Switching on applies the zone's turn-on volume**, a fixed level or `LAST` depending on
+  how the zone is set up. The volume is read back afterwards, asking twice.
+
+Known limits, each needing an unmeasured behaviour or an unlikely combination:
+
+- **Scene order matters for latency.** A scene that switches zone B off before zone A on,
+  with B the last zone playing, puts the amplifier in standby and then wakes it (~10 s).
+  The end state is right. List the zones being switched on first.
+- **A wake that fails part-way** skips the post-wake zone-offs. If standby also ignored the
+  pre-wake ones and the boot then completes late, revived zones play. The error is raised,
+  and the next poll shows them on.
+- **Home Assistant stopping mid-wake** is not waited for: stopping does not unload
+  integrations. Unload and reload are.
+- **Nothing checks the premise.** Home Assistant owning power depends on the amplifier's
+  Auto On method being Power Button with sleep off, and the integration does not read that
+  setting. See the roadmap.
 
 ## Forbidden operations
 

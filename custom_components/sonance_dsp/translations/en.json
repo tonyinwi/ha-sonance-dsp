@@ -15,7 +15,7 @@
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the amplifier. Check the IP address and that nothing else holds a control connection \u2014 the amplifier accepts only one at a time.",
+      "cannot_connect": "Failed to connect to the amplifier. Check the IP address and that nothing else holds a control connection — the amplifier accepts only one at a time.",
       "unknown": "Unexpected error"
     },
     "abort": {
@@ -56,6 +56,21 @@
     },
     "unknown_source": {
       "message": "{source} is not an input on this amplifier. Available sources: {sources}."
+    },
+    "amp_did_not_wake": {
+      "message": "The amplifier did not finish waking within {seconds} seconds. Check that it is powered and that its Auto On method is Power Button."
+    },
+    "amp_wake_recently_failed": {
+      "message": "The amplifier did not wake on the last attempt, so it will not be tried again for {seconds} seconds unless it is seen on first. Try again later."
+    },
+    "amp_power_unknown": {
+      "message": "The amplifier did not say whether it is on or in standby, so nothing was switched. Try again."
+    },
+    "zone_power_not_confirmed": {
+      "message": "Zone {zone} did not report {state} after two attempts."
+    },
+    "zone_power_unknown": {
+      "message": "The amplifier is on, but zone {zone}'s power could not be read from its status page, so it was not switched on: it may already be playing, and switching it on again could reset its volume. Try again once the status page answers."
     }
   }
 }

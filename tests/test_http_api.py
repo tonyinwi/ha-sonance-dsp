@@ -246,15 +246,33 @@ async def test_group_power_is_case_insensitive(
 
 
 @pytest.mark.parametrize(
-    "payload", [{}, {"power-status": []}, {"power-status": None}], ids=str
+    "payload",
+    [{}, {"power-status": []}, {"power-status": None}, {"power-status": "on"}],
+    ids=str,
 )
-async def test_group_power_absent_returns_empty(
+async def test_group_power_absent_is_the_page_not_answering(
     amp: AiohttpClientMocker, api: SonanceHttpApi, payload: dict
 ) -> None:
-    """A missing key is degraded state, not an error: the zones stay controllable."""
+    """Not an empty map: callers read a missing zone as off.
+
+    Turning the last zone off on the strength of an empty map would put the
+    amplifier in standby under zones that are playing. SonanceHttpError is what
+    the coordinator treats as "status page down", which keeps volume control
+    and the last known zone power.
+    """
     amp.get(STATUS, json=payload)
 
-    assert await api.group_power() == {}
+    with pytest.raises(SonanceHttpError):
+        await api.group_power()
+
+
+async def test_an_unrecognised_power_value_is_unknown_not_off(
+    amp: AiohttpClientMocker, api: SonanceHttpApi
+) -> None:
+    """Read as off, it would tell turn_off that no other zone is playing."""
+    amp.get(STATUS, json={"power-status": ["on", "standby", "off", ""]})
+
+    assert await api.group_power() == {0: True, 2: False}
 
 
 async def test_group_mute_maps_on_off_to_bools(
@@ -481,6 +499,10 @@ async def test_transport_errors_raise(
         pytest.param("<html>404 not found</html>", id="html-error-page"),
         pytest.param("", id="empty-body"),
         pytest.param('{"power-status": ["on",', id="truncated-json"),
+        # Real aiohttp returns None for an empty body instead of raising, as
+        # the mocker does; "null" is how that reaches the code here.
+        pytest.param("null", id="json-null"),
+        pytest.param("[]", id="json-list"),
     ],
 )
 async def test_malformed_json_raises(
