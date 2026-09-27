@@ -56,6 +56,10 @@ channel, 1L through 4R.
  "output-volumes":["-27","-27", ...]}
 ```
 
+`output-volumes` is the **live** level per channel: it matched TCP reads and followed a
+power-up to −70 and a restore back to −27 (2026-09-27), so levels can be checked without
+taking the TCP session.
+
 It also returns `turn-on-volumes`, `maximum-volumes`, `gain-offset`, `level-trim-dBs`,
 `stereo-or-mono`, `bridge-modes`, `mode-sources`, `sources-1` and `sources-2`. Three
 change how the device should be driven:
@@ -273,7 +277,8 @@ Measured:
   zones A–D, awake and straight after a wake.
 
   *Corrected 2026-09-27:* PR #13 recorded "a mute sent straight after a zone-on survives"
-  from one sample, a zone off for only a few seconds; every later run showed the window.
+  from one sample, a zone off for only a few seconds -- too short to power up again (see
+  below); every longer-off run showed the window.
   *Corrected 2026-09-26:* an earlier "re-muting immediately sticks" came from a probe that
   waited 0.5 s per command.
 - **Standby and wake do not clear mute.**
@@ -300,6 +305,9 @@ Also measured 2026-09-27 (zone D, the others silent):
 - **A zone-off in standby is echoed, but the standby status page still shows the flag.**
   The zone came back briefly at the wake, took its turn-on volume at ~0.56 s, and ended off.
 - **A wake does not change the stored volume of zones that are off.**
+- **A zone off for only a few seconds does not power up again**: its zone-on applies no
+  turn-on volume and leaves its mute alone. Off 30–40 s, it does both (zone A, same
+  day). The threshold between is unmeasured; the short case is harmless either way.
 
 Not measured; the integration does not depend on them:
 **power-on to an amp already on**, and **standby to one already in standby.**
