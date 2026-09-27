@@ -72,5 +72,19 @@
     "zone_power_unknown": {
       "message": "The amplifier is on, but zone {zone}'s power could not be read from its status page, so it was not switched on: it may already be playing, and switching it on again could reset its volume. Try again once the status page answers."
     }
+  },
+  "issues": {
+    "auto_on_method": {
+      "title": "{name}: Auto On is {method}, not Power Button",
+      "description": "Home Assistant controls this amplifier's power, which is only safe with its Auto On method set to **Power Button**. With {method}, the amplifier can wake zones by itself. Set it in the amplifier's web UI, under General Settings."
+    },
+    "channel_sleep": {
+      "title": "{name}: sleep is on for some channels",
+      "description": "Sleep is on for {channels}. Home Assistant controls this amplifier's power, and sleep would switch zones off without it knowing. Set every channel's sleep to **OFF** in the amplifier's web UI, under General Settings."
+    },
+    "turn_on_volume": {
+      "title": "{name}: turn-on volume is not {silent} dB",
+      "description": "For about a second after a zone is switched on, the amplifier plays it **unmuted at its turn-on volume**, whatever its mute. Set the turn-on volume to {silent} dB so that second is silent; Home Assistant then restores the zone's own level. Not yet at {silent} dB: {zones}. Set it in the amplifier's web UI, under In/Out Settings."
+    }
   }
 }

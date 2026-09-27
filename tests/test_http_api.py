@@ -718,3 +718,40 @@ def test_topology_defaults_are_empty_not_none() -> None:
     assert t.gain_offset == []
     assert t.sources_1 == []
     assert t.maximum_db(0) is None
+
+
+async def test_power_setup_reads_auto_on_and_sleep_by_name(
+    amp: AiohttpClientMocker, api: SonanceHttpApi
+) -> None:
+    """Captured shape (2026-09-27): sleep values are indices into the items."""
+    amp.get(
+        GENERAL,
+        json={
+            "auto-on-method": "Power Button",
+            "audio-off-delay": [1, 2, 3, 1, 1, 1, 1, 1],
+            "audio-off-delay-items": [
+                {"name": "OFF", "value": "1"},
+                {"name": "After 15 Min", "value": "2"},
+                {"name": "After 3 HRS", "value": "3"},
+            ],
+            "audio-off-delay-titles": ["1 LEFT", "1 RIGHT", "2 LEFT", "2 RIGHT",
+                                       "3 LEFT", "3 RIGHT", "4 LEFT", "4 RIGHT"],
+        },
+    )
+
+    setup = await api.power_setup()
+
+    assert setup.auto_on_method == "Power Button"
+    assert setup.sleep[:3] == ["OFF", "After 15 Min", "After 3 HRS"]
+    assert setup.sleep_titles[1] == "1 RIGHT"
+
+
+async def test_power_setup_without_the_keys_is_unknown_not_wrong(
+    amp: AiohttpClientMocker, api: SonanceHttpApi
+) -> None:
+    amp.get(GENERAL, json={"serial-number": "X"})
+
+    setup = await api.power_setup()
+
+    assert setup.auto_on_method is None
+    assert setup.sleep == []

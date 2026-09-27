@@ -157,7 +157,9 @@ Volume up and down move one device step (1 dB), not Home Assistant's default 10%
 Home Assistant owns power. The amplifier's Auto On method must be **Power Button** with
 every channel's sleep **OFF**, so nothing changes power by itself. In `Audio` mode a zone
 wakes the moment its source plays, and a zone unmuted by accident at 2am plays into the
-garden.
+garden. Those two settings and every zone's −70 dB turn-on volume are read at setup and
+daily, each with a repair issue while wrong (`checks.py`): a factory reset or a web-UI
+change undoes them silently, and the integration cannot set them itself.
 
 The rules rest on [Power: measured in Power Button mode](protocol.md#power-measured-in-power-button-mode),
 including what was not measured.
@@ -266,8 +268,6 @@ Known limits, each needing an unmeasured behaviour or an unlikely combination:
   and the next poll shows them on.
 - **Home Assistant stopping mid-wake** is not waited for: stopping does not unload
   integrations. Unload and reload do.
-- **Nothing checks the premise.** The integration does not read the Auto On setting. See
-  the [roadmap](roadmap.md).
 
 ## Forbidden operations
 
