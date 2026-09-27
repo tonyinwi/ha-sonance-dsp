@@ -98,8 +98,13 @@ audio, **each zone is an independent player** with its own source, volume, mute 
 and zones on one source share its playback.
 
 That fits the standard `media_player`: source selection routes the amp, power switches the
-zone, and mirroring shows the source's track; transport pass-through and
-`media_player.join` fit the same model ([roadmap](roadmap.md#transport-and-grouping)).
+zone, mirroring shows the source's track, and transport passes to the source's player;
+`media_player.join` fits the same model ([roadmap](roadmap.md#transport-and-grouping)).
+
+**Transport only while the zone is on.** Play, pause, stop and skip go to the linked
+player, and the zone offers exactly the ones that player does. An off zone offers none and
+refuses them: playback belongs to the source, so "play" there would start every other zone
+on it and leave this one silent. A link into this integration is never followed.
 There is no second kind of entity, and no "volume" averaged from other volumes, which
 [`gain-offset`](protocol.md#http-endpoints) would make meaningless.
 

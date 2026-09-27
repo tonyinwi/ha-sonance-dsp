@@ -15,14 +15,29 @@ from datetime import datetime
 from typing import Any
 
 from homeassistant.components.media_player import (
+    DOMAIN as MEDIA_PLAYER_DOMAIN,
+)
+from homeassistant.components.media_player import (
     MediaPlayerDeviceClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
 )
-from homeassistant.const import STATE_PAUSED, STATE_PLAYING
+from homeassistant.const import (
+    ATTR_ENTITY_ID,
+    ATTR_SUPPORTED_FEATURES,
+    SERVICE_MEDIA_NEXT_TRACK,
+    SERVICE_MEDIA_PAUSE,
+    SERVICE_MEDIA_PLAY,
+    SERVICE_MEDIA_PREVIOUS_TRACK,
+    SERVICE_MEDIA_STOP,
+    STATE_PAUSED,
+    STATE_PLAYING,
+    STATE_UNAVAILABLE,
+)
 from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
-from homeassistant.exceptions import ServiceValidationError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 
@@ -43,6 +58,21 @@ from .protocol import GroupState
 # One socket, one command at a time. A coordinator centralises inbound polling
 # but does nothing to limit outbound service calls.
 PARALLEL_UPDATES = 1
+
+# Transport, passed through to the zone's linked upstream player. Offered only
+# while the zone is on: playback belongs to the SOURCE, so "play" on a zone that
+# is off would start music in every other zone on the same source, and this
+# zone would stay silent -- the failure power control exists to prevent.
+_TRANSPORT: dict[MediaPlayerEntityFeature, str] = {
+    MediaPlayerEntityFeature.PLAY: SERVICE_MEDIA_PLAY,
+    MediaPlayerEntityFeature.PAUSE: SERVICE_MEDIA_PAUSE,
+    MediaPlayerEntityFeature.STOP: SERVICE_MEDIA_STOP,
+    MediaPlayerEntityFeature.NEXT_TRACK: SERVICE_MEDIA_NEXT_TRACK,
+    MediaPlayerEntityFeature.PREVIOUS_TRACK: SERVICE_MEDIA_PREVIOUS_TRACK,
+}
+_TRANSPORT_FEATURES = MediaPlayerEntityFeature(0)
+for _feature in _TRANSPORT:
+    _TRANSPORT_FEATURES |= _feature
 
 # Attributes proxied verbatim from a linked upstream player.
 _LINKED_ATTRS = (
@@ -349,6 +379,73 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
     @callback
     def _linked_changed(self, _event: Event[EventStateChangedData]) -> None:
         self.async_write_ha_state()
+
+    # --- transport -----------------------------------------------------------
+
+    @property
+    def supported_features(self) -> MediaPlayerEntityFeature:
+        """The zone's own features, plus the transport its upstream offers."""
+        features = self._attr_supported_features
+        upstream = self._upstream()
+        if upstream is not None:
+            offered = MediaPlayerEntityFeature(
+                upstream.attributes.get(ATTR_SUPPORTED_FEATURES, 0)
+            )
+            features |= offered & _TRANSPORT_FEATURES
+        return features
+
+    def _upstream(self):
+        """The linked player, if transport may be passed to it now.
+
+        None when the zone is not known to be on, when nothing is linked to its
+        source, when the link is unavailable, or when it points back into this
+        integration -- a loop between zones would recurse.
+        """
+        upstream = self._linked_state()
+        if upstream is None or upstream.state == STATE_UNAVAILABLE:
+            return None
+        entry = er.async_get(self.hass).async_get(upstream.entity_id)
+        if entry is not None and entry.platform == DOMAIN:
+            return None
+        return upstream
+
+    async def _async_pass_through(self, feature: MediaPlayerEntityFeature) -> None:
+        if self._powered() is not True:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="transport_zone_off",
+                translation_placeholders={"entity_id": self.entity_id},
+            )
+        if not self.supported_features & feature:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="transport_unavailable",
+                translation_placeholders={"entity_id": self.entity_id},
+            )
+        upstream = self._upstream()
+        assert upstream is not None  # implied by the feature check
+        await self.hass.services.async_call(
+            MEDIA_PLAYER_DOMAIN,
+            _TRANSPORT[feature],
+            {ATTR_ENTITY_ID: upstream.entity_id},
+            blocking=True,
+            context=self._context,
+        )
+
+    async def async_media_play(self) -> None:
+        await self._async_pass_through(MediaPlayerEntityFeature.PLAY)
+
+    async def async_media_pause(self) -> None:
+        await self._async_pass_through(MediaPlayerEntityFeature.PAUSE)
+
+    async def async_media_stop(self) -> None:
+        await self._async_pass_through(MediaPlayerEntityFeature.STOP)
+
+    async def async_media_next_track(self) -> None:
+        await self._async_pass_through(MediaPlayerEntityFeature.NEXT_TRACK)
+
+    async def async_media_previous_track(self) -> None:
+        await self._async_pass_through(MediaPlayerEntityFeature.PREVIOUS_TRACK)
 
     # --- attributes --------------------------------------------------------
 
