@@ -112,13 +112,17 @@ Browse has no such gate, so the zone refuses it itself.
   streamer and its zones (Assist, an area, a group) would skip once per player.
 - **No search.** Assist's search-and-play needs one target; a zone beside its player makes
   "play X in \<area\>" ambiguous.
-- **No announcements.** Refused, not stripped: on the source one would sound in every zone
-  on it, at the player's own announcement volume. Text-to-speech goes to the player.
+- **No announcements.** Dropped with a warning, never passed on: on the source one would
+  sound in every zone on it. Dropped rather than refused, because an announcement to an
+  area, floor or label holding a zone that is on would otherwise fail as a whole after the
+  player itself had spoken. Text-to-speech is also caught by its id, because a universal
+  player strips the announce flag; a plain chime sent through one arrives as ordinary
+  media. Send announcements to the player.
 - **Media is the player's.** Browse returns its tree unchanged, thumbnails included; ids
   pass through unresolved.
 - **One call, one forward.** Zones in one call on one source forward once, keyed on the
-  call's context and the request while it is in flight. A call naming the player and its
-  zones reaches the player twice: target one or the other.
+  call's context and the request until the forward returns. A call that reaches the player
+  and its zones, by name, area, floor or label, reaches the player twice.
 - **Loops are dropped.** A link into this integration is not followed. A forward that comes
   back through another player, such as a group containing the zone, carries the context
   the zone gave it, and is dropped. Browse carries no context, so a call-path guard

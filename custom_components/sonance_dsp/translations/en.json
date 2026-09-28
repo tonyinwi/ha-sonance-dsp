@@ -78,9 +78,6 @@
     "transport_unavailable": {
       "message": "{entity_id} has no linked player that offers this control."
     },
-    "announce_refused": {
-      "message": "{entity_id} does not take announcements: its source would play one in every zone on it. Send it to the source's player."
-    },
     "browse_unavailable": {
       "message": "{entity_id} can browse only while it is on and its source's player can browse."
     }

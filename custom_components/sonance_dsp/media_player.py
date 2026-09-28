@@ -10,6 +10,7 @@ reading "On, 61%" into one that shows what is actually playing.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import deque
 from collections.abc import Callable
@@ -121,6 +122,11 @@ _IN_FLIGHT: HassKey[set[tuple[str, str, str, str]]] = HassKey(
 _BROWSING: ContextVar[frozenset[str]] = ContextVar(
     f"{DOMAIN}_browsing", default=frozenset()
 )
+
+
+def _is_tts(media_id: str) -> bool:
+    """Text-to-speech, as tts.speak and the media browser send it."""
+    return media_id.startswith("media-source://tts") or "/api/tts_proxy/" in media_id
 
 
 async def async_setup_entry(
@@ -500,10 +506,14 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
             )
         finally:
             if key is not None:
-                # On the next loop pass, not now: zones in the same call are
-                # already queued, and must see it even if the player answered
-                # at once.
-                self.hass.loop.call_soon(in_flight.discard, key)
+                # Yield once first: zones in the same call are already queued,
+                # and must see it even if the player answered without
+                # suspending. Then drop it before returning, so the caller's
+                # next step is a new request.
+                try:
+                    await asyncio.sleep(0)
+                finally:
+                    in_flight.discard(key)
 
     async def async_media_play(self) -> None:
         await self._async_pass_through(
@@ -525,16 +535,20 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
     ) -> None:
         """Play one of the linked player's own ids on it: the whole source.
 
-        Announcements are refused, not passed on: they are how text-to-speech
-        and notifications reach a player, and on the source they would sound
-        in every zone on it, at the player's announcement volume.
+        Announcements and text-to-speech are dropped, not passed on: on the
+        source they would sound in every zone on it. Dropped rather than
+        refused, because an announcement to an area holding a zone that is on
+        would otherwise fail as a whole after the player itself had spoken.
+        Text-to-speech is also caught by its id: a universal player strips
+        the announce flag.
         """
-        if kwargs.get(ATTR_MEDIA_ANNOUNCE):
-            raise ServiceValidationError(
-                translation_domain=DOMAIN,
-                translation_key="announce_refused",
-                translation_placeholders={"entity_id": self.entity_id},
+        if kwargs.get(ATTR_MEDIA_ANNOUNCE) or _is_tts(media_id):
+            _LOGGER.warning(
+                "%s: not passing an announcement to its source; send it to "
+                "the source's player",
+                self.entity_id,
             )
+            return
         await self._async_pass_through(
             MediaPlayerEntityFeature.PLAY_MEDIA,
             SERVICE_PLAY_MEDIA,

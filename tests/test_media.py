@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -26,7 +27,7 @@ from homeassistant.components.media_player import MediaPlayerEntityFeature as F
 from homeassistant.components.media_player import intent as media_intent
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import Context, HomeAssistant, State
-from homeassistant.exceptions import ServiceNotSupported, ServiceValidationError
+from homeassistant.exceptions import ServiceNotSupported
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent
@@ -323,33 +324,116 @@ async def test_the_zone_then_shows_it_playing_without_the_media_id(
     assert "media_content_id" not in state.attributes
 
 
+TTS = "media-source://tts/demo?message=hi"
+
+
+async def say(hass, entity_ids) -> None:
+    """The call tts.speak makes: a list of players, announce=True, blocking."""
+    await play(
+        hass,
+        entity_ids,
+        media_content_type="music",
+        media_content_id=TTS,
+        announce=True,
+    )
+
+
 @pytest.mark.parametrize(
-    "media_id", ["http://x/a.mp3", "media-source://tts/cloud?message=hi"]
+    ("media_id", "announce"),
+    [("http://x/chime.mp3", True), (TTS, True), (TTS, None)],
+    ids=["announce", "tts", "tts-without-announce"],
 )
-async def test_announcements_are_refused(hass: HomeAssistant, media_id: str) -> None:
+async def test_announcements_and_speech_are_dropped(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    media_id: str,
+    announce: bool | None,
+) -> None:
+    """Not passed on, where they would sound in every zone on the source."""
+    streamer, _, _ = await setup(hass)
+    data = {"announce": announce} if announce is not None else {}
+
+    await play(hass, PATIO, media_content_id=media_id, **data)
+
+    assert plays(streamer) == []
+    assert "not passing an announcement" in caplog.text
+
+
+async def test_ordinary_media_with_announce_false_plays(hass: HomeAssistant) -> None:
     streamer, _, _ = await setup(hass)
 
-    with pytest.raises(ServiceValidationError) as err:
-        await play(hass, PATIO, media_content_id=media_id, announce=True)
     await play(hass, PATIO, announce=False)
 
-    assert err.value.translation_key == "announce_refused"
     assert len(plays(streamer)) == 1
-    assert not plays(streamer)[0][3].get("announce")
 
 
-async def test_what_tts_speak_sends_is_refused(hass: HomeAssistant) -> None:
-    """The call tts/entity.py makes: a list of players, announce=True, blocking."""
+async def test_what_tts_speak_sends_to_zones_plays_nothing(
+    hass: HomeAssistant,
+) -> None:
     streamer, _, _ = await setup(hass)
 
-    with pytest.raises(ServiceValidationError):
-        await play(
-            hass,
-            [PATIO, DECK],
-            media_content_type="music",
-            media_content_id="media-source://tts/demo?message=hi",
-            announce=True,
-        )
+    await say(hass, [PATIO, DECK])
+
+    assert plays(streamer) == []
+
+
+async def test_an_announcement_to_an_area_plays_once_and_the_script_goes_on(
+    hass: HomeAssistant,
+) -> None:
+    """Refusing would fail the whole call after the player itself had spoken."""
+    streamer, _, _ = await setup(hass)
+    area = in_area(hass, STREAMER, PATIO, DECK)
+    assert await async_setup_component(
+        hass, "input_boolean", {"input_boolean": {"after": {}}}
+    )
+    assert await async_setup_component(
+        hass,
+        "script",
+        {
+            "script": {
+                "doorbell": {
+                    "sequence": [
+                        {
+                            "action": "media_player.play_media",
+                            "target": {"area_id": area},
+                            "data": {
+                                "media_content_type": "music",
+                                "media_content_id": TTS,
+                                "announce": True,
+                            },
+                        },
+                        {
+                            "action": "input_boolean.turn_on",
+                            "target": {"entity_id": "input_boolean.after"},
+                        },
+                    ]
+                }
+            }
+        },
+    )
+
+    await hass.services.async_call("script", "doorbell", blocking=True)
+    await hass.async_block_till_done()
+
+    [(_, _, media_id, kwargs, _)] = plays(streamer)
+    assert (media_id, kwargs.get("announce")) == (TTS, True)
+    assert hass.states.get("input_boolean.after").state == "on"
+
+
+async def test_speech_through_a_universal_player_is_dropped(
+    hass: HomeAssistant,
+) -> None:
+    """A universal player strips the announce flag: the id still gives it away."""
+    universal = {"platform": "universal", "name": "Patio Speaker", "children": [PATIO]}
+    streamer, _, c = await setup(hass, players=[universal])
+    # Set up before the zones, it missed their first write: give it another.
+    c.data.groups[0] = replace(c.data.groups[0], volume_db=-28)
+    c.async_set_updated_data(c.data)
+    await hass.async_block_till_done()
+    assert features(hass, "media_player.patio_speaker") & F.PLAY_MEDIA
+
+    await say(hass, "media_player.patio_speaker")
+    await hass.async_block_till_done()
 
     assert plays(streamer) == []
 
@@ -357,7 +441,6 @@ async def test_what_tts_speak_sends_is_refused(hass: HomeAssistant) -> None:
 async def test_a_group_of_zones_passes_on_no_announcement(
     hass: HomeAssistant,
 ) -> None:
-    """A group forwards without blocking, so the refusal is only logged."""
     streamer, _, _ = await setup(
         hass, players=[{"platform": "group", "name": "Yard", "entities": [PATIO, DECK]}]
     )
@@ -444,11 +527,13 @@ async def test_different_requests_in_one_context_each_play(
     assert len(plays(streamer)) == 2
 
 
+@pytest.mark.parametrize("suspends", [True, False])
 async def test_the_same_play_twice_in_a_script_is_sent_twice(
-    hass: HomeAssistant,
+    hass: HomeAssistant, suspends: bool
 ) -> None:
     """One call, one forward: not one context, one forward."""
     streamer, _, _ = await setup(hass)
+    streamer.suspends = suspends
     step = {
         "action": "media_player.play_media",
         "target": {"entity_id": PATIO},
@@ -461,6 +546,23 @@ async def test_the_same_play_twice_in_a_script_is_sent_twice(
     await hass.services.async_call("script", "twice", blocking=True)
 
     assert len(plays(streamer)) == 2
+
+
+async def test_a_script_of_pause_play_pause_ends_paused(hass: HomeAssistant) -> None:
+    """A player that answers without suspending, as ESPHome's does."""
+    streamer, _, _ = await setup(hass)
+    streamer.suspends = False
+    steps = [
+        {"action": f"media_player.{service}", "target": {"entity_id": PATIO}}
+        for service in ("media_pause", "media_play", "media_pause")
+    ]
+    assert await async_setup_component(
+        hass, "script", {"script": {"s": {"sequence": steps}}}
+    )
+
+    await hass.services.async_call("script", "s", blocking=True)
+
+    assert streamer.calls == ["pause", "play", "pause"]
 
 
 async def test_an_area_with_the_player_and_its_zones_plays_twice(
