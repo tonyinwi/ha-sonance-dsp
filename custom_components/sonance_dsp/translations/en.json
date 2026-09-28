@@ -73,10 +73,13 @@
       "message": "Zone {zone} did not say whether it is muted, so its volume was not changed: on this amplifier a volume change un-mutes. Try again."
     },
     "transport_zone_off": {
-      "message": "{entity_id} is off. Playback belongs to its source, so play, pause and stop would act on every other zone playing it; switch the zone on first."
+      "message": "{entity_id} is off. Playback belongs to its source, so this would act on every other zone playing it; switch the zone on first."
     },
     "transport_unavailable": {
       "message": "{entity_id} has no linked player that offers this control."
+    },
+    "browse_unavailable": {
+      "message": "{entity_id} can browse only while it is on and its source's player can browse."
     }
   },
   "issues": {

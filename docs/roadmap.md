@@ -3,7 +3,7 @@
 Narrow first, then branching. The transport is the risky part, so it was proven under one
 entity before anything else depended on it.
 
-Status: **0.4.0.** Device facts are in [`protocol.md`](protocol.md), decisions in
+Status: **0.5.0.** Device facts are in [`protocol.md`](protocol.md), decisions in
 [`design.md`](design.md).
 
 ## Done
@@ -15,15 +15,24 @@ Status: **0.4.0.** Device facts are in [`protocol.md`](protocol.md), decisions i
 | 2a — upstream mirroring | A zone shows title, artist, album, artwork and transport state from the `media_player` linked (per source, in the options flow) to its current source |
 | 3 — source and power | `SELECT_SOURCE` by the device's input names. Zone power, owned by Home Assistant: see [Power](design.md#power) |
 | Transport | Play, pause and stop passed to the linked player, only while the zone is on |
+| Media | Play media and browse through the linked player, only while the zone is on; no search or announcements |
 
 The amp-level entity planned for stage 2 was dropped by design: see
 [the zone is the player](design.md#the-zone-is-the-player-there-is-no-amp-level-entity).
 Music Assistant needs nothing more: each zone maps as an MA player's volume control
 ([README](../README.md#music-assistant)).
 
-**MVP live checks.** Tests cannot make these, and nothing in the repo records them as done:
+**MVP live checks.** Tests cannot make these. Done 2026-09-28 on zone D, with the source
+idle and each level read back from the amplifier's own page (`output-volumes`,
+`mute-volumes`):
 
-- The slider moves the amplifier and the read-back matches.
+- The slider moves the amplifier and the read-back matches: −30 → −40, up to −39, down to
+  −40.
+- A volume set while muted is held: HA showed −35, the amplifier stayed muted at −40
+  through two polls, and unmuting applied −35.
+
+Not yet done:
+
 - A volume change in the amplifier's web UI appears in HA within one poll interval.
 - A pulled network cable marks entities unavailable within one interval, and they recover
   without restarting Home Assistant.
@@ -33,10 +42,10 @@ Music Assistant needs nothing more: each zone maps as an MA player's volume cont
 
 ## Next
 
-### Transport and grouping
+### Grouping
 
-Transport is done. Next: play and browse media through the linked player, then route
-zones onto a common source with `media_player.join`. Both follow from
+Transport and media are done. Next: route zones onto a common source with
+`media_player.join`, which follows from
 [the zone is the player](design.md#the-zone-is-the-player-there-is-no-amp-level-entity).
 
 ### Power follow-ups
