@@ -30,6 +30,11 @@ idle and each level read back from the amplifier's own page (`output-volumes`,
   −40.
 - A volume set while muted is held: HA showed −35, the amplifier stayed muted at −40
   through two polls, and unmuting applied −35.
+- On 0.5.0, with zones A–C muted: browsing zone D showed Music Assistant's library; play
+  media from zone D started the Sonos once (one idle → playing transition), audible on D
+  only; −40 → −35 was louder; pause from zone D stopped it. A playlist that Music Assistant
+  held empty (its provider needed signing in again) failed with MA's own error, shown in
+  HA.
 
 Not yet done:
 
