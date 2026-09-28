@@ -13,17 +13,26 @@ from __future__ import annotations
 import logging
 from collections import deque
 from collections.abc import Callable
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
 from homeassistant.components.media_player import (
-    DOMAIN as MEDIA_PLAYER_DOMAIN,
-)
-from homeassistant.components.media_player import (
+    ATTR_MEDIA_ANNOUNCE,
+    ATTR_MEDIA_CONTENT_ID,
+    ATTR_MEDIA_CONTENT_TYPE,
+    DATA_COMPONENT,
+    SERVICE_PLAY_MEDIA,
+    BrowseError,
+    BrowseMedia,
     MediaPlayerDeviceClass,
     MediaPlayerEntity,
     MediaPlayerEntityFeature,
     MediaPlayerState,
+    MediaType,
+)
+from homeassistant.components.media_player import (
+    DOMAIN as MEDIA_PLAYER_DOMAIN,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
@@ -71,39 +80,46 @@ _LOGGER = logging.getLogger(__name__)
 # any zone deadlocks them all.
 PARALLEL_UPDATES = 0
 
-# Transport, passed through to the zone's linked upstream player. Offered only
-# while the zone is on: playback belongs to the SOURCE, so "play" on a zone that
-# is off would start music in every other zone on the same source, and this
-# zone would stay silent -- the failure power control exists to prevent.
+# Transport and media, passed through to the zone's linked upstream player.
+# Offered only while the zone is on: playback belongs to the SOURCE, so "play"
+# on a zone that is off would start music in every other zone on the same
+# source, and this zone would stay silent -- the failure power control exists
+# to prevent.
 #
 # Only the idempotent controls. Every zone on a source would forward a skip, so
 # one "next track" to the streamer and its zones -- Assist, an area, a group --
 # would skip once per player.
-_TRANSPORT: dict[MediaPlayerEntityFeature, str] = {
-    MediaPlayerEntityFeature.PLAY: SERVICE_MEDIA_PLAY,
-    MediaPlayerEntityFeature.PAUSE: SERVICE_MEDIA_PAUSE,
-    MediaPlayerEntityFeature.STOP: SERVICE_MEDIA_STOP,
-}
-_TRANSPORT_FEATURES = MediaPlayerEntityFeature(0)
-for _feature in _TRANSPORT:
-    _TRANSPORT_FEATURES |= _feature
+_TRANSPORT_FEATURES = (
+    MediaPlayerEntityFeature.PLAY
+    | MediaPlayerEntityFeature.PAUSE
+    | MediaPlayerEntityFeature.STOP
+)
+
+# The linked player's own library to browse, and its own ids to play. Not
+# search: Assist would find the player and its zones, and refuse to pick. Not
+# announcements: see async_play_media.
+_MEDIA_FEATURES = (
+    MediaPlayerEntityFeature.PLAY_MEDIA
+    | MediaPlayerEntityFeature.BROWSE_MEDIA
+    | MediaPlayerEntityFeature.MEDIA_ENQUEUE
+)
 
 # Contexts of recent forwards. A call carrying one has come back round through
 # the upstream (a group containing this zone, say), so it is dropped.
 _FORWARDED: HassKey[deque[str]] = HassKey(f"{DOMAIN}_forwarded")
 _FORWARDED_KEEP = 64
 
-# Attributes proxied verbatim from a linked upstream player.
-_LINKED_ATTRS = (
-    "media_title",
-    "media_artist",
-    "media_album_name",
-    "media_content_id",
-    "media_content_type",
-    "media_duration",
-    "media_position",
-    "media_position_updated_at",
-    "entity_picture",
+# Forwards under way, by incoming context, upstream and request. One call to
+# several zones on one source (an area, a group, a list) reaches it once.
+_IN_FLIGHT: HassKey[set[tuple[str, str, str, str]]] = HassKey(
+    f"{DOMAIN}_in_flight"
+)
+
+# Zones browsing on this call path. Browsing is a direct call with no context,
+# so a player that browses back into a zone is caught here instead. Not used
+# for play or transport: tasks inherit it, and a dropped pause fails open.
+_BROWSING: ContextVar[frozenset[str]] = ContextVar(
+    f"{DOMAIN}_browsing", default=frozenset()
 )
 
 
@@ -340,9 +356,8 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
     def media_album_name(self) -> str | None:
         return self._linked_attr("media_album_name")
 
-    @property
-    def media_content_id(self) -> str | None:
-        return self._linked_attr("media_content_id")
+    # No media_content_id: a scene would replay it, once per zone -- a stale
+    # track, or a play then a pause for a paused capture.
 
     @property
     def media_content_type(self) -> str | None:
@@ -403,18 +418,18 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
 
     @property
     def supported_features(self) -> MediaPlayerEntityFeature:
-        """The zone's own features, plus the transport its upstream offers."""
+        """The zone's own features, plus the transport and media its upstream offers."""
         features = self._attr_supported_features
         upstream = self._upstream()
         if upstream is not None:
             offered = MediaPlayerEntityFeature(
                 upstream.attributes.get(ATTR_SUPPORTED_FEATURES, 0)
             )
-            features |= offered & _TRANSPORT_FEATURES
+            features |= offered & (_TRANSPORT_FEATURES | _MEDIA_FEATURES)
         return features
 
     def _upstream(self):
-        """The linked player, if transport may be passed to it now.
+        """The linked player, if transport and media may be passed to it now.
 
         None when the zone is not known to be on, when nothing is linked to its
         source, when the link is unavailable, or when it points back into this
@@ -429,7 +444,12 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
             return None
         return upstream
 
-    async def _async_pass_through(self, feature: MediaPlayerEntityFeature) -> None:
+    async def _async_pass_through(
+        self,
+        feature: MediaPlayerEntityFeature,
+        service: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
         incoming = self._context
         forwarded = self.hass.data.setdefault(
             _FORWARDED, deque(maxlen=_FORWARDED_KEEP)
@@ -454,27 +474,113 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
             )
         upstream = self._upstream()
         assert upstream is not None  # implied by the feature check
+        data = data or {}
+        in_flight = self.hass.data.setdefault(_IN_FLIGHT, set())
+        key = None
+        if incoming is not None:
+            key = (incoming.id, upstream.entity_id, service, repr(data))
+            if key in in_flight:
+                _LOGGER.debug(
+                    "%s: another zone on this source sent it", self.entity_id
+                )
+                return
+            in_flight.add(key)
         child = Context(
             user_id=incoming.user_id if incoming is not None else None,
             parent_id=incoming.id if incoming is not None else None,
         )
         forwarded.append(child.id)
-        await self.hass.services.async_call(
-            MEDIA_PLAYER_DOMAIN,
-            _TRANSPORT[feature],
-            {ATTR_ENTITY_ID: upstream.entity_id},
-            blocking=True,
-            context=child,
-        )
+        try:
+            await self.hass.services.async_call(
+                MEDIA_PLAYER_DOMAIN,
+                service,
+                {**data, ATTR_ENTITY_ID: upstream.entity_id},
+                blocking=True,
+                context=child,
+            )
+        finally:
+            if key is not None:
+                # On the next loop pass, not now: zones in the same call are
+                # already queued, and must see it even if the player answered
+                # at once.
+                self.hass.loop.call_soon(in_flight.discard, key)
 
     async def async_media_play(self) -> None:
-        await self._async_pass_through(MediaPlayerEntityFeature.PLAY)
+        await self._async_pass_through(
+            MediaPlayerEntityFeature.PLAY, SERVICE_MEDIA_PLAY
+        )
 
     async def async_media_pause(self) -> None:
-        await self._async_pass_through(MediaPlayerEntityFeature.PAUSE)
+        await self._async_pass_through(
+            MediaPlayerEntityFeature.PAUSE, SERVICE_MEDIA_PAUSE
+        )
 
     async def async_media_stop(self) -> None:
-        await self._async_pass_through(MediaPlayerEntityFeature.STOP)
+        await self._async_pass_through(
+            MediaPlayerEntityFeature.STOP, SERVICE_MEDIA_STOP
+        )
+
+    async def async_play_media(
+        self, media_type: MediaType | str, media_id: str, **kwargs: Any
+    ) -> None:
+        """Play one of the linked player's own ids on it: the whole source.
+
+        Announcements are refused, not passed on: they are how text-to-speech
+        and notifications reach a player, and on the source they would sound
+        in every zone on it, at the player's announcement volume.
+        """
+        if kwargs.get(ATTR_MEDIA_ANNOUNCE):
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="announce_refused",
+                translation_placeholders={"entity_id": self.entity_id},
+            )
+        await self._async_pass_through(
+            MediaPlayerEntityFeature.PLAY_MEDIA,
+            SERVICE_PLAY_MEDIA,
+            {
+                ATTR_MEDIA_CONTENT_TYPE: media_type,
+                ATTR_MEDIA_CONTENT_ID: media_id,
+                **kwargs,
+            },
+        )
+
+    async def async_browse_media(
+        self,
+        media_content_type: MediaType | str | None = None,
+        media_content_id: str | None = None,
+    ) -> BrowseMedia:
+        """The linked player's own library, while the zone is on."""
+        # The browse_media service is not feature-gated, so check here.
+        upstream = self._upstream()
+        path = _BROWSING.get()
+        player = None
+        if (
+            upstream is not None
+            and self.supported_features & MediaPlayerEntityFeature.BROWSE_MEDIA
+            and self.entity_id not in path
+        ):
+            player = self.hass.data[DATA_COMPONENT].get_entity(upstream.entity_id)
+        if player is None:
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="browse_unavailable",
+                translation_placeholders={"entity_id": self.entity_id},
+            )
+        token = _BROWSING.set(path | {self.entity_id})
+        try:
+            return await player.async_browse_media(
+                media_content_type, media_content_id
+            )
+        except NotImplementedError as err:
+            # Otherwise Home Assistant reports it as a bug in this integration.
+            raise BrowseError(
+                translation_domain=DOMAIN,
+                translation_key="browse_unavailable",
+                translation_placeholders={"entity_id": self.entity_id},
+            ) from err
+        finally:
+            _BROWSING.reset(token)
 
     # --- attributes --------------------------------------------------------
 

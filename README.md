@@ -50,11 +50,12 @@ Zones are discovered and named from the amp, and each has:
 - **Mirroring**: link a source to the player feeding it, and zones on it show its track,
   artwork and play state.
 - **Power**, owned by Home Assistant ([below](#power)).
-- **Transport**: play, pause and stop go to the linked player, while the zone is on.
-  Playback belongs to the source, so every zone on it follows: in a scene meant to control
-  playback, include the player, not the zones. No skip, which would skip once per zone.
+- **Transport and media**: play, pause, stop, play media and browse go to the linked
+  player, while the zone is on. Playback belongs to the source, so every zone on it
+  follows: in a scene meant to control playback, include the player, not the zones. No
+  skip, no search, and no announcements or text-to-speech: send those to the player.
 
-Not yet: play and browse media, `media_player.join`, diagnostics.
+Not yet: `media_player.join`, diagnostics.
 
 **HomeKit:** zones are receivers, the only class HomeKit gives a volume slider, so each
 needs its own accessory-mode HomeKit instance; a UI-created bridge silently excludes them.
@@ -122,6 +123,9 @@ several zones has no single volume to map: by design, each zone keeps its own.
 
 Leave **mute native** if the source's mute works, and then never use MA's *FAKE* mute: it
 drives volume to zero, the one control that does nothing.
+
+Don't add zones as players in MA's Home Assistant provider: a zone only forwards to the
+player feeding it.
 
 ## More
 

@@ -98,26 +98,42 @@ audio, **each zone is an independent player** with its own source, volume, mute 
 and zones on one source share its playback.
 
 That fits the standard `media_player`: source selection routes the amp, power switches the
-zone, mirroring shows the source's track, and transport passes to the source's player;
-`media_player.join` fits the same model ([roadmap](roadmap.md#transport-and-grouping)).
+zone, mirroring shows the source's track, and transport and media pass to the source's player;
+`media_player.join` fits the same model ([roadmap](roadmap.md#grouping)).
 
-**Transport only while the zone is on.** Play, pause and stop go to the linked player, and
-the zone offers those the player does. An off zone offers none: playback belongs to the
-source, so "play" there would start every other zone on it and leave this one silent. Home
-Assistant rejects a control an entity does not offer, so the integration's own refusal
-only catches a call queued before the zone went off.
+**Transport and media only while the zone is on.** Play, pause, stop, play media and
+browse go to the linked player, and the zone offers those the player does. An off zone
+offers none: playback belongs to the source, so "play" there would start every other zone
+on it and leave this one silent. Home Assistant rejects a control an entity does not offer,
+so the integration's own refusal only catches a call queued before the zone went off.
+Browse has no such gate, so the zone refuses it itself.
 
 - **No skip.** Every zone on a source would forward it, so one "next track" sent to the
   streamer and its zones (Assist, an area, a group) would skip once per player.
+- **No search.** Assist's search-and-play needs one target; a zone beside its player makes
+  "play X in \<area\>" ambiguous.
+- **No announcements.** Refused, not stripped: on the source one would sound in every zone
+  on it, at the player's own announcement volume. Text-to-speech goes to the player.
+- **Media is the player's.** Browse returns its tree unchanged, thumbnails included; ids
+  pass through unresolved.
+- **One call, one forward.** Zones in one call on one source forward once, keyed on the
+  call's context and the request while it is in flight. A call naming the player and its
+  zones reaches the player twice: target one or the other.
 - **Loops are dropped.** A link into this integration is not followed. A forward that comes
   back through another player, such as a group containing the zone, carries the context
-  the zone gave it, and is dropped.
-- **Muted is not off.** A muted zone offers play: mute is a listening control on a zone that
-  is on, and the source-wide effect is the rule above.
-- **Scenes and toggles act on the source.** Restoring a zone captured as paused pauses every
-  zone on its source, and play/pause toggled on two zones at once can cancel out.
+  the zone gave it, and is dropped. Browse carries no context, so a call-path guard
+  refuses it instead; transport and play do not use that guard, because tasks inherit it
+  and a dropped pause fails open.
+- **Muted is not off.** A muted zone offers play and play media: mute is a listening
+  control on a zone that is on, and the source-wide effect is the rule above.
+- **Scenes and toggles act on the source.** Zones do not report `media_content_id`, so a
+  restore resumes or pauses the source and never replays a track. Scenes saved with one
+  before 0.5.0 still replay it. Play/pause toggled on two zones at once can cancel out.
+- **An explicit target that is off fails the whole call**, as for any entity without the
+  feature.
 - **Features follow power**, so each zone on/off rewrites the entity registry and reloads
   the zone's HomeKit accessory. Expected, not a bug.
+
 There is no second kind of entity, and no "volume" averaged from other volumes, which
 [`gain-offset`](protocol.md#http-endpoints) would make meaningless.
 

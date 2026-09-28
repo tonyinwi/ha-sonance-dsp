@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from homeassistant.components.media_player import (
+    BrowseError,
     MediaPlayerDeviceClass,
     MediaPlayerEntityFeature,
     MediaPlayerState,
@@ -30,6 +31,7 @@ from pytest_homeassistant_custom_component.common import (
 from custom_components.sonance_dsp.const import DOMAIN
 from custom_components.sonance_dsp.coordinator import SonanceCoordinator, SonanceData
 from custom_components.sonance_dsp.http_api import AmplifierIdentity, Topology
+from custom_components.sonance_dsp.media_player import _IN_FLIGHT as IN_FLIGHT
 from custom_components.sonance_dsp.media_player import SonanceZone
 from custom_components.sonance_dsp.protocol import GroupState
 
@@ -480,3 +482,90 @@ async def test_a_link_into_this_integration_is_never_followed(
     z = linked_zone(coordinator, hass, features=int(TRANSPORT))
 
     assert not z.supported_features & TRANSPORT
+
+
+# ---------------------------------------------------------------------------
+# Play and browse media (service-layer tests are in test_media.py)
+# ---------------------------------------------------------------------------
+
+MEDIA = (
+    MediaPlayerEntityFeature.PLAY_MEDIA
+    | MediaPlayerEntityFeature.BROWSE_MEDIA
+    | MediaPlayerEntityFeature.MEDIA_ENQUEUE
+)
+ALL_MEDIA = int(
+    MEDIA
+    | MediaPlayerEntityFeature.SEARCH_MEDIA
+    | MediaPlayerEntityFeature.MEDIA_ANNOUNCE
+)
+
+
+async def test_a_player_that_cannot_browse_gives_no_browse(
+    coordinator: SonanceCoordinator, hass: HomeAssistant
+) -> None:
+    z = linked_zone(
+        coordinator, hass, features=int(MediaPlayerEntityFeature.PLAY_MEDIA)
+    )
+
+    assert not z.supported_features & MediaPlayerEntityFeature.BROWSE_MEDIA
+    with pytest.raises(BrowseError):
+        await z.async_browse_media()
+
+
+@pytest.mark.parametrize("setup", ["unavailable", "no_link", "self_link"])
+async def test_no_media_without_a_usable_player(
+    coordinator: SonanceCoordinator, hass: HomeAssistant, setup: str
+) -> None:
+    if setup == "self_link":
+        er.async_get(hass).async_get_or_create(
+            "media_player", DOMAIN, "loop", suggested_object_id="streamer"
+        )
+    state = "unavailable" if setup == "unavailable" else "playing"
+    z = linked_zone(coordinator, hass, state=state, features=ALL_MEDIA)
+    if setup == "no_link":
+        z = zone(coordinator, hass)
+
+    assert not z.supported_features & MEDIA
+    with pytest.raises(BrowseError):
+        await z.async_browse_media()
+
+
+async def test_play_media_without_a_context_still_forwards_once(
+    coordinator: SonanceCoordinator, hass: HomeAssistant
+) -> None:
+    """Nothing to merge on, so nothing is kept."""
+    calls = async_mock_service(hass, "media_player", "play_media")
+    z = linked_zone(coordinator, hass, features=ALL_MEDIA)
+    assert z._context is None
+
+    await z.async_play_media("track", "x")
+
+    assert len(calls) == 1
+    assert not hass.data.get(IN_FLIGHT)
+
+
+async def test_play_media_queued_before_the_zone_went_off_is_refused(
+    coordinator: SonanceCoordinator, hass: HomeAssistant
+) -> None:
+    calls = async_mock_service(hass, "media_player", "play_media")
+    z = linked_zone(coordinator, hass, features=ALL_MEDIA)
+    z.async_set_context(Context())
+    coordinator.data.group_power[0] = False
+
+    with pytest.raises(ServiceValidationError) as err:
+        await z.async_play_media("track", "x")
+
+    assert err.value.translation_key == "transport_zone_off"
+    assert calls == []
+
+
+async def test_play_media_cannot_be_redirected_by_its_arguments(
+    coordinator: SonanceCoordinator, hass: HomeAssistant
+) -> None:
+    """The service strips entity_id; a direct caller could still pass one."""
+    calls = async_mock_service(hass, "media_player", "play_media")
+    z = linked_zone(coordinator, hass, features=ALL_MEDIA)
+
+    await z.async_play_media("track", "x", entity_id="media_player.elsewhere")
+
+    assert calls[0].data["entity_id"] == "media_player.streamer"
