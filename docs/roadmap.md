@@ -35,30 +35,27 @@ idle and each level read back from the amplifier's own page (`output-volumes`,
   only; −40 → −35 was louder; pause from zone D stopped it. A playlist that Music Assistant
   held empty (its provider needed signing in again) failed with MA's own error, shown in
   HA.
+- A volume change outside HA appears within one poll: zone D set to −45 through the
+  amplifier's own web endpoint (`in-out-settings`, `name=output-volume`) showed in HA 3.5 s
+  later, and so did the change back to −38 (10 s poll).
+- A pulled network cable: the amplifier went at 13:58:23, all four zones were unavailable
+  at 13:58:27, and they recovered on their own at 14:00:27, no restart, state intact
+  (0.5.1). One error logged going down, one line coming back.
+- Assist: "set Back Yard Output 4 volume to 30 percent" on zone D, on and playing, took it
+  from −40 to −49 dB (30 % of −70…0), read back from the amplifier. With the zone off, the
+  same phrase was refused (0.5.1) and the amplifier kept −49. Assist says only "an
+  unexpected error occurred": its intent helper replaces the refusal's text and logs it
+  as an error with a traceback. HA's behaviour, not ours; the only way round it is to drop
+  volume features while off, which would change the HomeKit accessory.
 
 Not yet done:
 
-- A volume change in the amplifier's web UI appears in HA within one poll interval.
-- A pulled network cable marks entities unavailable within one interval, and they recover
-  without restarting Home Assistant.
-- The zone appears in HomeKit **with a working volume slider**: the only check that
-  catches a wrong `device_class` or a missing `VOLUME_STEP`.
-- Assist: "set \<zone\> volume to 30 percent".
+- HomeKit, deferred: a zone in its own accessory-mode instance, with volume from the iOS
+  Remote. The only check that catches a wrong `device_class` or a missing `VOLUME_STEP`.
 
 ## Next
 
-### Grouping
-
-Transport and media are done. Next: route zones onto a common source with
-`media_player.join`, which follows from
-[the zone is the player](design.md#the-zone-is-the-player-there-is-no-amp-level-entity).
-
-### Power follow-ups
-
-- **Measure what the code defends against blind**, listed under *not measured* in
-  [Power: measured in Power Button mode](protocol.md#power-measured-in-power-button-mode).
-  Each needs the amplifier and a go-ahead, with the source idle. Zone-on to a zone already
-  on matters most: it would settle the one power rule that is a choice.
+Transport and media are done. In order:
 
 ### 4 — Diagnostics and configuration
 
@@ -76,11 +73,24 @@ Bronze, then Silver, tracked in
 [`quality_scale.yaml`](../custom_components/sonance_dsp/quality_scale.yaml).
 `quality_scale` goes into `manifest.json` only once a tier is met.
 
+### Grouping, once there is a second source
+
+Route zones onto a common source with `media_player.join`, which follows from
+[the zone is the player](design.md#the-zone-is-the-player-there-is-no-amp-level-entity).
+With one streamer feeding every zone, all zones already share its source and a join would
+do nothing, so this waits for a second streamer on input 2 or 4.
+
 ### 6 — Other models
 
 The DSP 2-150 and 2-750 differ in two parameters ([protocol](protocol.md#other-models)).
 Discovery already finds whatever groups exist; `SOURCE_COUNT` is a fixed 4 and needs to
 become per-model. Confirming needs the hardware.
+
+### Power follow-ups: closed
+
+*2026-09-28:* zone-on to a zone already on was measured (it does
+nothing, [protocol](protocol.md#power-measured-in-power-button-mode)); what is still
+unmeasured, power-on to an amp already on and standby to one in standby, nothing depends on.
 
 ## Open questions
 

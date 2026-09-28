@@ -58,8 +58,11 @@ Zones are discovered and named from the amp, and each has:
 
 Not yet: `media_player.join`, diagnostics.
 
-**HomeKit:** zones are receivers, the only class HomeKit gives a volume slider, so each
-needs its own accessory-mode HomeKit instance; a UI-created bridge silently excludes them.
+**HomeKit:** zones are receivers, the only class HomeKit gives volume control, so each
+zone needs its own accessory-mode HomeKit instance. A HomeKit Bridge set up with the Media
+player domain ticked creates one for every TV and receiver in the house, not only the
+zones. To add one zone, set up a bridge without that domain, then set its mode to
+Accessory and pick the zone.
 
 ## Volume
 
