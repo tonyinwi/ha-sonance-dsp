@@ -42,13 +42,16 @@ idle and each level read back from the amplifier's own page (`output-volumes`,
   at 13:58:27, and they recovered on their own at 14:00:27, no restart, state intact
   (0.5.1). One error logged going down, one line coming back.
 - Assist: "set Back Yard Output 4 volume to 30 percent" on zone D, on and playing, took it
-  from −40 to −49 dB (30 % of −70…0), read back from the amplifier.
+  from −40 to −49 dB (30 % of −70…0), read back from the amplifier. With the zone off, the
+  same phrase was refused (0.5.1) and the amplifier kept −49. Assist says only "an
+  unexpected error occurred": its intent helper replaces the refusal's text and logs it
+  as an error with a traceback. HA's behaviour, not ours; the only way round it is to drop
+  volume features while off, which would change the HomeKit accessory.
 
 Not yet done:
 
 - HomeKit, deferred: a zone in its own accessory-mode instance, with volume from the iOS
   Remote. The only check that catches a wrong `device_class` or a missing `VOLUME_STEP`.
-- Assist on a zone that is off: the refusal (0.5.1).
 
 ## Next
 
