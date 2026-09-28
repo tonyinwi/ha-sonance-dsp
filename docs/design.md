@@ -152,14 +152,17 @@ routes `media_player` by device class:
 
 | Device class | HomeKit result |
 |---|---|
-| `RECEIVER` | Receiver accessory, the only route with a real volume control. Its speaker service needs `VOLUME_MUTE` or `VOLUME_STEP`; `VOLUME_SET` alone yields nothing. |
+| `RECEIVER` | Television-type accessory, the only route with volume control (through the iOS Remote, from HA's HomeKit accessory code; not yet checked live). Its speaker service needs `VOLUME_MUTE` or `VOLUME_STEP`; `VOLUME_SET` alone yields nothing. |
 | `SPEAKER` or unset | A mute-only switch with no volume, or nothing at all without `VOLUME_MUTE`. |
 
 The cost of `RECEIVER`: Home Assistant makes `TV`/`RECEIVER`/`PROJECTOR` accessory-mode
-only, so a bridge created in the UI **silently excludes** these zones. Each needs its own
-HomeKit instance, as every AVR integration does. That buys a volume slider; `SPEAKER`
-would buy bridging with no volume, the wrong half for an amplifier. Alexa and Assist need
-only `VOLUME_SET`.
+only, so each zone needs its own HomeKit instance, as every AVR integration does. The
+bridge never includes them. If its setup has the Media player domain ticked, it instead
+creates a separate instance for every TV, receiver and projector in the house
+(`homekit/config_flow.py`, `_async_add_entries_for_accessory_mode_entities`). *Corrected
+2026-09-28: this said a UI-created bridge "silently excludes" the zones.* That buys volume
+control; `SPEAKER` would buy bridging with no volume, the wrong half for an amplifier.
+Alexa and Assist need only `VOLUME_SET`.
 
 ### Why not `number` entities for volume
 

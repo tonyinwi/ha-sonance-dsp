@@ -35,15 +35,19 @@ idle and each level read back from the amplifier's own page (`output-volumes`,
   only; −40 → −35 was louder; pause from zone D stopped it. A playlist that Music Assistant
   held empty (its provider needed signing in again) failed with MA's own error, shown in
   HA.
+- A volume change outside HA appears within one poll: zone D set to −45 through the
+  amplifier's own web endpoint (`in-out-settings`, `name=output-volume`) showed in HA 3.5 s
+  later, and so did the change back to −38 (10 s poll).
+- A pulled network cable: the amplifier went at 13:58:23, all four zones were unavailable
+  at 13:58:27, and they recovered on their own at 14:00:27, no restart, state intact
+  (0.5.1). One error logged going down, one line coming back.
 
 Not yet done:
 
-- A volume change in the amplifier's web UI appears in HA within one poll interval.
-- A pulled network cable marks entities unavailable within one interval, and they recover
-  without restarting Home Assistant.
-- The zone appears in HomeKit **with a working volume slider**: the only check that
-  catches a wrong `device_class` or a missing `VOLUME_STEP`.
-- Assist: "set \<zone\> volume to 30 percent".
+- HomeKit, deferred: a zone in its own accessory-mode instance, with volume from the iOS
+  Remote. The only check that catches a wrong `device_class` or a missing `VOLUME_STEP`.
+- Assist: "set \<zone\> volume to 30 percent" on a zone that is on, and the refusal on
+  one that is off (0.5.1).
 
 ## Next
 
