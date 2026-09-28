@@ -52,18 +52,7 @@ Not yet done:
 
 ## Next
 
-### Grouping
-
-Transport and media are done. Next: route zones onto a common source with
-`media_player.join`, which follows from
-[the zone is the player](design.md#the-zone-is-the-player-there-is-no-amp-level-entity).
-
-### Power follow-ups
-
-- **Measure what the code defends against blind**, listed under *not measured* in
-  [Power: measured in Power Button mode](protocol.md#power-measured-in-power-button-mode).
-  Each needs the amplifier and a go-ahead, with the source idle. Zone-on to a zone already
-  on matters most: it would settle the one power rule that is a choice.
+Transport and media are done. In order:
 
 ### 4 — Diagnostics and configuration
 
@@ -81,11 +70,24 @@ Bronze, then Silver, tracked in
 [`quality_scale.yaml`](../custom_components/sonance_dsp/quality_scale.yaml).
 `quality_scale` goes into `manifest.json` only once a tier is met.
 
+### Grouping, once there is a second source
+
+Route zones onto a common source with `media_player.join`, which follows from
+[the zone is the player](design.md#the-zone-is-the-player-there-is-no-amp-level-entity).
+With one streamer feeding every zone, all zones already share its source and a join would
+do nothing, so this waits for a second streamer on input 2 or 4.
+
 ### 6 — Other models
 
 The DSP 2-150 and 2-750 differ in two parameters ([protocol](protocol.md#other-models)).
 Discovery already finds whatever groups exist; `SOURCE_COUNT` is a fixed 4 and needs to
 become per-model. Confirming needs the hardware.
+
+### Power follow-ups: closed
+
+*2026-09-28:* zone-on to a zone already on was measured (it does
+nothing, [protocol](protocol.md#power-measured-in-power-button-mode)); what is still
+unmeasured, power-on to an amp already on and standby to one in standby, nothing depends on.
 
 ## Open questions
 

@@ -84,6 +84,12 @@ change it did not apply (amp in standby); a `name=output-volume` write applied r
 (during the push test). One field misbehaves, not the endpoint. The integration writes
 only over TCP.
 
+`output-volume` applies in standby too: on 2026-09-28, with the amp in standby and every
+zone off, `index=6` and `index=7` to −45 and back to −38 each showed in `output-volumes`
+at once and in HA within 3.5 s. It is per channel, so a group needs both of its channels.
+It is also the one route around the integration's refusal of volume on an off zone (see
+[design](design.md#power)).
+
 ## Frame format
 
 ```

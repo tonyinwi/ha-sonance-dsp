@@ -99,7 +99,7 @@ and zones on one source share its playback.
 
 That fits the standard `media_player`: source selection routes the amp, power switches the
 zone, mirroring shows the source's track, and transport and media pass to the source's player;
-`media_player.join` fits the same model ([roadmap](roadmap.md#grouping)).
+`media_player.join` fits the same model ([roadmap](roadmap.md#grouping-once-there-is-a-second-source)).
 
 **Transport and media only while the zone is on.** Play, pause, stop, play media and
 browse go to the linked player, and the zone offers those the player does. An off zone
@@ -205,6 +205,13 @@ change undoes them silently, and the integration cannot set them itself.
 The rules rest on [Power: measured in Power Button mode](protocol.md#power-measured-in-power-button-mode),
 including what was not measured.
 
+**Home Assistant stopping changes nothing.** A restart or shutdown never mutes, stops or
+powers off the amp, and setup sends it nothing. HA isn't in the audio path: while it is
+down the amp keeps its zones, mutes and levels, and with Auto On at Power Button nothing
+wakes. A shutdown hook would fire on every restart and update, and undoing it would take an
+unmute at startup. A crash or power cut skips it anyway, so it could never be the safety
+net. *Decided by Tony, 2026-09-28.*
+
 - **A zone is on only when the amplifier and the zone are both on.** Zone flags survive
   standby, so either alone lies. Off if either reads off, else unknown if either is
   unknown, never `on`: a switched-off zone still answers queries. An unknown zone does not
@@ -230,7 +237,8 @@ including what was not measured.
   off (zone off, or amp in standby), checked inside the command lock. They stay allowed
   when power is unknown: turning a playing zone down must not depend on the status page.
   The features stay advertised; taking them away while off would change the zone's HomeKit
-  accessory.
+  accessory. This guards HA only: the amp's own web page and front panel can still set an
+  off zone's level, and it plays at the next switch-on.
 - **A muted zone is never sent a volume.** Any volume change un-mutes a zone, even an off
   one ([protocol](protocol.md#power-measured-in-power-button-mode)), so while a zone is
   muted, volume changes from HA are held and shown, not sent, and unmuting applies the
