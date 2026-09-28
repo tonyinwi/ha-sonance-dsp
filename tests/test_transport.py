@@ -22,7 +22,7 @@ from homeassistant.components.media_player import (
 )
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ServiceNotSupported
+from homeassistant.exceptions import ServiceNotSupported, ServiceValidationError
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent
@@ -284,3 +284,19 @@ async def test_play_on_an_off_zone_is_not_offered(hass: HomeAssistant) -> None:
         await call(hass, "media_play", PATIO)
 
     assert streamer.calls == []
+
+
+async def test_volume_on_an_off_zone_is_refused_through_the_service(
+    hass: HomeAssistant,
+) -> None:
+    """A dashboard slider stays live on an off entity; the zone refuses it."""
+    _, c = await setup_zones(hass)
+    c.data.group_power[0] = False
+    c.async_set_updated_data(c.data)
+    await hass.async_block_till_done()
+
+    with pytest.raises(ServiceValidationError) as err:
+        await call(hass, "volume_set", PATIO, volume_level=0.9)
+
+    assert err.value.translation_key == "volume_zone_off"
+    c.client.set_volume.assert_not_awaited()

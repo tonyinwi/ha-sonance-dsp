@@ -83,6 +83,8 @@ volume, at setup and daily, and raises a repair issue for any that is wrong.
 - Switching a zone on restores its mute and then its volume, and checks both.
 - A muted zone is never sent a volume: on this amp any volume change un-mutes. Its level
   is held and applied when it is unmuted.
+- An off zone's volume can't be changed: the amp would keep it as the zone's next
+  switch-on level.
 - Waking the amp takes about 10 s, and brings back only the zone asked for.
 - A zone already on is left alone.
 - Switching the last zone off puts the amp in standby.

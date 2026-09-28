@@ -661,6 +661,7 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
     async def async_set_volume_level(self, volume: float) -> None:
         db = self._to_db(volume)
         async with self.coordinator.command_lock:
+            self._refuse_volume_while_off()
             await self.coordinator.async_write_volume(self._group, db)
 
     @command
@@ -674,8 +675,25 @@ class SonanceZone(SonanceEntity, MediaPlayerEntity):
     async def _step(self, delta: int) -> None:
         """Move one device dB, respecting the configured ceiling and floor."""
         async with self.coordinator.command_lock:
+            self._refuse_volume_while_off()
             await self.coordinator.async_step_volume(
                 self._group, delta, self._effective_max_db
+            )
+
+    def _refuse_volume_while_off(self) -> None:
+        """Refuse a volume change for a zone known to be off.
+
+        The amp keeps it, and switching the zone on restores it: a slider
+        nudged on an off zone becomes its level next time, unheard until then.
+        Checked inside the command lock, so a change queued behind a switch-off
+        is refused too. Allowed when power is unknown: turning a playing zone
+        down must not depend on the status page answering.
+        """
+        if self._powered() is False:
+            raise ServiceValidationError(
+                translation_domain=DOMAIN,
+                translation_key="volume_zone_off",
+                translation_placeholders={"entity_id": self.entity_id},
             )
 
     @command
