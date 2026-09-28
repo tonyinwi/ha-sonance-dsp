@@ -22,9 +22,17 @@ The amp-level entity planned for stage 2 was dropped by design: see
 Music Assistant needs nothing more: each zone maps as an MA player's volume control
 ([README](../README.md#music-assistant)).
 
-**MVP live checks.** Tests cannot make these, and nothing in the repo records them as done:
+**MVP live checks.** Tests cannot make these. Done 2026-09-28 on zone D, with the source
+idle and each level read back from the amplifier's own page (`output-volumes`,
+`mute-volumes`):
 
-- The slider moves the amplifier and the read-back matches.
+- The slider moves the amplifier and the read-back matches: −30 → −40, up to −39, down to
+  −40.
+- A volume set while muted is held: HA showed −35, the amplifier stayed muted at −40
+  through two polls, and unmuting applied −35.
+
+Not yet done:
+
 - A volume change in the amplifier's web UI appears in HA within one poll interval.
 - A pulled network cable marks entities unavailable within one interval, and they recover
   without restarting Home Assistant.
