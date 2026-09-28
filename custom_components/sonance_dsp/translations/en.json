@@ -75,6 +75,9 @@
     "transport_zone_off": {
       "message": "{entity_id} is off. Playback belongs to its source, so this would act on every other zone playing it; switch the zone on first."
     },
+    "volume_zone_off": {
+      "message": "{entity_id} is off. A volume set now would be its level the next time it is switched on; switch the zone on first."
+    },
     "transport_unavailable": {
       "message": "{entity_id} has no linked player that offers this control."
     },

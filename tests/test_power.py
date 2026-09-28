@@ -39,7 +39,7 @@ from unittest.mock import MagicMock
 import pytest
 from homeassistant.components.media_player import MediaPlayerState
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import (
@@ -2720,19 +2720,84 @@ async def test_a_hold_survives_an_off_on_cycle(hass: HomeAssistant) -> None:
     assert amp.mute[0] is False
 
 
-async def test_a_level_held_while_off_is_used_at_switch_on(hass: HomeAssistant) -> None:
+async def test_a_held_level_survives_off_and_is_used_at_switch_on(
+    hass: HomeAssistant,
+) -> None:
     amp = FakeAmp()
-    amp.group_power[0] = False
     amp.volume[0] = -20
     amp.mute[0] = True
     c = make(hass, amp)
     await zone(c, hass).async_set_volume_level(0.5)  # -35, held: muted
+    await c.async_turn_off(0)
+    amp.settle()
     assert c.held_level(0) == -35
 
     await c.async_turn_on(0, ceiling_db=0)
     amp.settle()
 
     assert c.held_level(0) == -35
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda z: z.async_set_volume_level(0.9),
+        lambda z: z.async_volume_up(),
+        lambda z: z.async_volume_down(),
+    ],
+    ids=["set", "up", "down"],
+)
+@pytest.mark.parametrize("off", ["zone", "amp"])
+async def test_volume_on_an_off_zone_is_refused(
+    hass: HomeAssistant, call, off: str
+) -> None:
+    """It would be the zone's level at the next switch-on, unheard until then."""
+    amp = FakeAmp()
+    c = make(hass, amp)
+    if off == "zone":
+        c.data.group_power[0] = False
+    else:
+        c.data.amp_power = False
+    before = list(amp.log)
+
+    with pytest.raises(ServiceValidationError) as err:
+        await call(zone(c, hass))
+
+    assert err.value.translation_key == "volume_zone_off"
+    assert amp.log == before
+    assert c.held_level(0) is None
+
+
+async def test_volume_on_a_zone_whose_power_is_unknown_is_allowed(
+    hass: HomeAssistant,
+) -> None:
+    """Turning a playing zone down must not need the status page."""
+    amp = FakeAmp()
+    c = make(hass, amp)
+    c.data.group_power = {}
+
+    await zone(c, hass).async_set_volume_level(0.5)
+
+    assert amp.volume[0] == -35
+
+
+async def test_a_volume_change_queued_behind_a_switch_off_is_refused(
+    hass: HomeAssistant,
+) -> None:
+    """The check is inside the lock: the zone was on when the call arrived."""
+    amp = FakeAmp()
+    c = make(hass, amp)
+    z = zone(c, hass)
+
+    async with c.command_lock:
+        change = asyncio.ensure_future(z.async_set_volume_level(0.9))
+        await asyncio.sleep(0)
+        assert not change.done()
+        c.data.group_power[0] = False  # what a switch-off publishes
+
+    with pytest.raises(ServiceValidationError):
+        await change
+    assert not any(e.startswith("vol0:") for e in amp.log)
 
 
 async def test_an_unmuted_switch_on_drops_a_stale_hold(hass: HomeAssistant) -> None:

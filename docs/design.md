@@ -221,6 +221,13 @@ including what was not measured.
   read from the amp (an off zone reports it), so it survives a restart. A restore that
   fails leaves the zone on at −70, and says so. **A muted zone is not restored**: any
   volume change un-mutes a zone on this amp, so its level is held instead (below).
+- **An off zone takes no volume.** The amp keeps a level sent to an off zone, and switching
+  it on restores that level, so a slider nudged while off would set the next switch-on
+  level, unheard until then. Volume set and step are refused while the zone is known to be
+  off (zone off, or amp in standby), checked inside the command lock. They stay allowed
+  when power is unknown: turning a playing zone down must not depend on the status page.
+  The features stay advertised; taking them away while off would change the zone's HomeKit
+  accessory.
 - **A muted zone is never sent a volume.** Any volume change un-mutes a zone, even an off
   one ([protocol](protocol.md#power-measured-in-power-button-mode)), so while a zone is
   muted, volume changes from HA are held and shown, not sent, and unmuting applies the
