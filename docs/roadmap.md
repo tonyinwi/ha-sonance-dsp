@@ -41,13 +41,14 @@ idle and each level read back from the amplifier's own page (`output-volumes`,
 - A pulled network cable: the amplifier went at 13:58:23, all four zones were unavailable
   at 13:58:27, and they recovered on their own at 14:00:27, no restart, state intact
   (0.5.1). One error logged going down, one line coming back.
+- Assist: "set Back Yard Output 4 volume to 30 percent" on zone D, on and playing, took it
+  from −40 to −49 dB (30 % of −70…0), read back from the amplifier.
 
 Not yet done:
 
 - HomeKit, deferred: a zone in its own accessory-mode instance, with volume from the iOS
   Remote. The only check that catches a wrong `device_class` or a missing `VOLUME_STEP`.
-- Assist: "set \<zone\> volume to 30 percent" on a zone that is on, and the refusal on
-  one that is off (0.5.1).
+- Assist on a zone that is off: the refusal (0.5.1).
 
 ## Next
 
